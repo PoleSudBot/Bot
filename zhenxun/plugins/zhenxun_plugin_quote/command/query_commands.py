@@ -315,12 +315,12 @@ async def _get_valid_random_quotes(
     memory_key = _build_random_memory_key(group_id, user_id_filter)
 
     if user_id_filter:
-        # 用户筛选同时依赖 quoted_user_id 和 user:<qq> tag，继续保留 Python 层过滤以保持现有语义。
-        random_candidates = [
-            quote
-            for quote in await Quote.filter(group_id=group_id)
-            if QuoteService._match_user_filter(quote, user_id_filter)
-        ]
+        candidate_ids = await QuoteService.get_quote_ids_for_user(
+            group_id, user_id_filter
+        )
+        random_candidates = await QuoteService.get_quotes_by_ids_in_order(
+            candidate_ids
+        )
         return (
             await _collect_valid_quotes_from_candidates(
                 memory_key, random_candidates, target_count
@@ -413,10 +413,16 @@ async def _send_history_quote(
     keyword: str,
     history_index: int,
     user_id_filter: str | None = None,
+    *,
+    tag_only: bool = False,
 ) -> None:
     """处理 -N 倒序指定请求，保持结果确定且不参与随机去重。"""
     quote = await QuoteService.get_quote_by_history_index(
-        group_id, history_index, keyword, user_id_filter
+        group_id,
+        history_index,
+        keyword,
+        user_id_filter,
+        tag_only=tag_only,
     )
     if not quote:
         keyword_hint = f"匹配 '{keyword}' 的" if keyword else "本群"
@@ -463,6 +469,9 @@ async def record_pool_handle(bot: Bot, event: Event, arp: Arparma, state: T_Stat
         search_keywords, arp.query("num.count")
     )
     search_key_processed = query_params.keyword
+    tag_only = search_key_processed.startswith("#") and len(search_key_processed) > 1
+    if tag_only:
+        search_key_processed = search_key_processed[1:].strip()
     request_count = query_params.count
     user_id_filter: str | None = str(at_user_info.target) if at_user_info else None
 
@@ -474,6 +483,7 @@ async def record_pool_handle(bot: Bot, event: Event, arp: Arparma, state: T_Stat
             search_key_processed,
             query_params.history_index,
             user_id_filter,
+            tag_only=tag_only,
         )
         return
 
@@ -483,10 +493,15 @@ async def record_pool_handle(bot: Bot, event: Event, arp: Arparma, state: T_Stat
 
     if search_key_processed:
         search_memory_key = _build_search_memory_key(
-            group_id, search_key_processed, user_id_filter
+            group_id,
+            f"#{search_key_processed}" if tag_only else search_key_processed,
+            user_id_filter,
         )
         matched_quotes = await QuoteService.search_quotes(
-            group_id, search_key_processed, user_id_filter
+            group_id,
+            search_key_processed,
+            user_id_filter,
+            tag_only=tag_only,
         )
         quotes = await _collect_valid_quotes_from_candidates(
             search_memory_key, matched_quotes, request_count
@@ -496,6 +511,11 @@ async def record_pool_handle(bot: Bot, event: Event, arp: Arparma, state: T_Stat
         elif matched_quotes:
             await MessageUtils.build_message(
                 "语录记录存在，但图片暂时不可用，请联系管理员检查。"
+            ).send(target=target, bot=bot)
+            return
+        elif tag_only:
+            await MessageUtils.build_message(
+                f"未找到 tag「{search_key_processed}」对应的语录。"
             ).send(target=target, bot=bot)
             return
         else:

@@ -193,7 +193,8 @@ def test_upload_success_message_reports_missing_auto_tags():
         missing_auto_tags=True,
     )
 
-    assert "未识别到文字标签，图片已直接保存" in message_parts[1]
+    assert "未识别到可用 tag，语录已保存" in message_parts[1]
+    assert "tag add 标签" in message_parts[1]
 
 
 def test_batch_upload_summary_reports_missing_auto_tag_count():
@@ -209,7 +210,8 @@ def test_batch_upload_summary_reports_missing_auto_tag_count():
     summary = upload_commands._build_batch_upload_summary(results)
 
     assert "成功 2/3 张" in summary
-    assert "其中 1 张未识别到文字标签，已直接保存" in summary
+    assert "其中 1 张未识别到可用 tag，已保存" in summary
+    assert "tag add 标签" in summary
 
 
 def test_plugin_usage_text_is_updated_to_new_commands():
@@ -232,4 +234,7 @@ def test_plugin_usage_text_is_updated_to_new_commands():
     assert 'key="BATCH_TEXT_RECOGNITION_PRIORITY"' in usage_text
     assert 'value="paddleocr_api"' in usage_text
     assert 'key="BATCH_UPLOAD_OCR_MODE"' not in usage_text
-    assert 'version="v1.2.1"' in usage_text
+    assert 'version="v1.4.0"' in usage_text
+    assert 'key="TAG_ALIAS_ADMIN_LEVEL"' in usage_text
+    assert "`taglink tag1 tag2 ...`" in usage_text
+    assert "`语录 #tag`" in usage_text

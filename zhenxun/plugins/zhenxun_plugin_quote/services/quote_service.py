@@ -5,6 +5,8 @@ from pathlib import Path
 import random
 import base64
 import uuid
+import unicodedata
+import time
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,7 +29,14 @@ from zhenxun.utils.platform import PlatformUtils
 import aiofiles
 
 from ..config import DATA_PATH, get_quote_path, resolve_quote_image_path
-from ..model import HotQuoteItemData, HotQuotesPageData, Quote, QuoteCardData
+from ..model import (
+    HotQuoteItemData,
+    HotQuotesPageData,
+    Quote,
+    QuoteCardData,
+    QuoteTag,
+    QuoteTagLink,
+)
 
 try:
     import spacy_pkuseg as pkuseg
@@ -48,11 +57,21 @@ except ImportError:
 
 @dataclass(frozen=True)
 class TagMutationResult:
-    """手动 tag 修改结果。"""
+    """统一 tag 修改结果。"""
 
     success: bool
     tags: list[str]
     changed_tags: list[str]
+
+
+@dataclass(frozen=True)
+class TagAliasMutationResult:
+    """群内 tag 互通修改结果。"""
+
+    success: bool
+    members: list[str]
+    existing_group_count: int = 0
+    requires_confirmation: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +135,9 @@ class QuoteService:
     _recent_quotes: ClassVar[TTLCache] = TTLCache(maxsize=1000, ttl=600)
     _max_history_per_key: ClassVar[int] = 30
     _user_tag_prefix: ClassVar[str] = "user:"
+    _tag_schema_version: ClassVar[int] = 1
+    _tag_migration_batch_size: ClassVar[int] = 200
+    _slow_query_seconds: ClassVar[float] = 0.5
     _operation_locks: ClassVar[_KeyedAsyncLockPool] = _KeyedAsyncLockPool()
 
     @classmethod
@@ -234,6 +256,14 @@ class QuoteService:
             return []
         return [part.strip() for part in text.split() if part.strip()]
 
+    @staticmethod
+    def normalize_tag_value(tag: str | None) -> str:
+        """生成用于群内唯一约束与精确查询的稳定 tag 值。"""
+        if tag is None:
+            return ""
+        normalized = unicodedata.normalize("NFKC", str(tag))
+        return " ".join(normalized.split()).casefold()
+
     @classmethod
     def normalize_tags(cls, tags: Iterable[str | None]) -> list[str]:
         normalized_tags: list[str] = []
@@ -242,10 +272,11 @@ class QuoteService:
         for tag in tags:
             if tag is None:
                 continue
-            tag_value = str(tag).strip()
-            if not tag_value or tag_value in seen:
+            tag_value = " ".join(unicodedata.normalize("NFKC", str(tag)).split())
+            normalized_value = cls.normalize_tag_value(tag_value)
+            if not normalized_value or normalized_value in seen:
                 continue
-            seen.add(tag_value)
+            seen.add(normalized_value)
             normalized_tags.append(tag_value)
 
         return normalized_tags
@@ -299,6 +330,353 @@ class QuoteService:
         return cls.normalize_tags(cls.get_manual_tags(quote) + cls.get_auto_tags(quote))
 
     @classmethod
+    def _uses_relation_tags(cls, quote: Quote) -> bool:
+        return getattr(quote, "tag_schema_version", None) == cls._tag_schema_version
+
+    @classmethod
+    async def _get_or_create_tag(
+        cls,
+        group_id: str,
+        value: str,
+        *,
+        connection=None,
+    ) -> QuoteTag:
+        normalized_value = cls.normalize_tag_value(value)
+        tag, _ = await QuoteTag.get_or_create(
+            group_id=str(group_id),
+            normalized_value=normalized_value,
+            defaults={"value": value},
+            using_db=connection,
+        )
+        return tag
+
+    @classmethod
+    async def _replace_quote_tag_links(
+        cls,
+        quote: Quote,
+        tags: Iterable[str],
+        *,
+        connection=None,
+    ) -> list[str]:
+        normalized_tags = cls.normalize_tags(tags)
+        link_query = QuoteTagLink.filter(quote_id=quote.id)
+        if connection is not None:
+            link_query = link_query.using_db(connection)
+        await link_query.delete()
+        for value in normalized_tags:
+            tag = await cls._get_or_create_tag(
+                str(quote.group_id), value, connection=connection
+            )
+            await QuoteTagLink.get_or_create(
+                quote_id=quote.id,
+                tag_id=tag.id,
+                using_db=connection,
+            )
+        return normalized_tags
+
+    @classmethod
+    async def _migrate_locked_quote(cls, quote: Quote, connection=None) -> list[str]:
+        """将一条旧 JSON 语录幂等迁移到统一 tag 关联表。"""
+        if cls._uses_relation_tags(quote):
+            link_query = QuoteTagLink.filter(quote_id=quote.id)
+            if connection is not None:
+                link_query = link_query.using_db(connection)
+            return list(
+                await link_query.order_by("id").values_list("tag__value", flat=True)
+            )
+
+        unified_tags = cls.get_all_tags(quote)
+        await cls._replace_quote_tag_links(
+            quote,
+            unified_tags,
+            connection=connection,
+        )
+        quote.tags = []
+        quote.manual_tags = unified_tags
+        quote.tag_schema_version = cls._tag_schema_version
+        await quote.save(
+            using_db=connection,
+            update_fields=["tags", "manual_tags", "tag_schema_version"],
+        )
+        return unified_tags
+
+    @classmethod
+    async def migrate_legacy_tags(cls, batch_size: int | None = None) -> int:
+        """分批迁移旧 tag；可重复执行，也可在任意批次后安全中断。"""
+        limit = batch_size or cls._tag_migration_batch_size
+        migrated = 0
+        while True:
+            quote_ids = list(
+                await Quote.filter(tag_schema_version=0)
+                .order_by("id")
+                .limit(limit)
+                .values_list("id", flat=True)
+            )
+            if not quote_ids:
+                break
+
+            for quote_id in quote_ids:
+                async with in_transaction() as connection:
+                    quote = (
+                        await Quote.filter(id=quote_id)
+                        .select_for_update()
+                        .using_db(connection)
+                        .get()
+                    )
+                    if not cls._uses_relation_tags(quote):
+                        await cls._migrate_locked_quote(quote, connection)
+                        migrated += 1
+            logger.info(
+                f"统一 tag 迁移进度：本批 {len(quote_ids)} 条，累计 {migrated} 条",
+                "群聊语录",
+            )
+        return migrated
+
+    @classmethod
+    async def get_quote_tags(cls, quote: Quote) -> list[str]:
+        """读取语录实际保存的统一 tag，旧记录在迁移前回退 JSON。"""
+        if not cls._uses_relation_tags(quote):
+            return cls.get_all_tags(quote)
+        return list(
+            await QuoteTagLink.filter(quote_id=quote.id)
+            .order_by("id")
+            .values_list("tag__value", flat=True)
+        )
+
+    @classmethod
+    async def get_quote_tag_groups(cls, quote: Quote) -> list[list[str]]:
+        """按互通组折叠展示语录 tag；组内成员均平等。"""
+        if not cls._uses_relation_tags(quote):
+            return [[tag] for tag in cls.get_all_tags(quote)]
+
+        linked_tags = list(
+            await QuoteTag.filter(quote_links__quote_id=quote.id).order_by("id")
+        )
+        display_groups: list[list[str]] = []
+        shown_alias_keys: set[str] = set()
+        for tag in linked_tags:
+            if not tag.alias_group_key:
+                display_groups.append([tag.value])
+                continue
+            if tag.alias_group_key in shown_alias_keys:
+                continue
+            shown_alias_keys.add(tag.alias_group_key)
+            members = list(
+                await QuoteTag.filter(
+                    group_id=str(quote.group_id),
+                    alias_group_key=tag.alias_group_key,
+                )
+                .order_by("id")
+                .values_list("value", flat=True)
+            )
+            display_groups.append(members)
+        return display_groups
+
+    @classmethod
+    async def get_tag_alias_group(cls, group_id: str, value: str) -> list[str]:
+        tag = await QuoteTag.filter(
+            group_id=str(group_id),
+            normalized_value=cls.normalize_tag_value(value),
+        ).first()
+        if not tag:
+            return []
+        if not tag.alias_group_key:
+            return [tag.value]
+        return list(
+            await QuoteTag.filter(
+                group_id=str(group_id),
+                alias_group_key=tag.alias_group_key,
+            )
+            .order_by("id")
+            .values_list("value", flat=True)
+        )
+
+    @classmethod
+    async def preview_tag_alias_link(
+        cls, group_id: str, values: Iterable[str]
+    ) -> TagAliasMutationResult:
+        normalized_values = cls.normalize_tags(values)
+        if len(normalized_values) < 2:
+            return TagAliasMutationResult(False, normalized_values)
+        normalized_keys = [cls.normalize_tag_value(value) for value in normalized_values]
+        existing_tags = list(
+            await QuoteTag.filter(
+                group_id=str(group_id), normalized_value__in=normalized_keys
+            )
+        )
+        existing_group_keys = {
+            tag.alias_group_key for tag in existing_tags if tag.alias_group_key
+        }
+        members = list(normalized_values)
+        if existing_group_keys:
+            group_members = await QuoteTag.filter(
+                group_id=str(group_id),
+                alias_group_key__in=list(existing_group_keys),
+            ).values_list("value", flat=True)
+            members = cls.normalize_tags([*members, *group_members])
+        return TagAliasMutationResult(
+            True,
+            members,
+            existing_group_count=len(existing_group_keys),
+            requires_confirmation=len(existing_group_keys) > 1,
+        )
+
+    @classmethod
+    async def link_tag_aliases(
+        cls,
+        group_id: str,
+        values: Iterable[str],
+        *,
+        confirm_merge: bool = False,
+    ) -> TagAliasMutationResult:
+        preview = await cls.preview_tag_alias_link(group_id, values)
+        if not preview.success or (
+            preview.requires_confirmation and not confirm_merge
+        ):
+            return preview
+
+        async with in_transaction() as connection:
+            tags = [
+                await cls._get_or_create_tag(
+                    str(group_id), value, connection=connection
+                )
+                for value in cls.normalize_tags(values)
+            ]
+            existing_keys = sorted(
+                {
+                    tag.alias_group_key
+                    for tag in tags
+                    if tag.alias_group_key is not None
+                }
+            )
+            target_key = existing_keys[0] if existing_keys else uuid.uuid4().hex
+            affected_query = QuoteTag.filter(
+                Q(id__in=[tag.id for tag in tags])
+                | Q(alias_group_key__in=existing_keys),
+                group_id=str(group_id),
+            ).using_db(connection)
+            await affected_query.update(alias_group_key=target_key)
+            members = list(
+                await QuoteTag.filter(
+                    group_id=str(group_id), alias_group_key=target_key
+                )
+                .using_db(connection)
+                .order_by("id")
+                .values_list("value", flat=True)
+            )
+        return TagAliasMutationResult(
+            True,
+            members,
+            existing_group_count=len(existing_keys),
+        )
+
+    @classmethod
+    async def unlink_tag_alias(
+        cls, group_id: str, value: str
+    ) -> TagAliasMutationResult:
+        async with in_transaction() as connection:
+            tag = await QuoteTag.filter(
+                group_id=str(group_id),
+                normalized_value=cls.normalize_tag_value(value),
+            ).using_db(connection).first()
+            if not tag:
+                return TagAliasMutationResult(False, [])
+            if not tag.alias_group_key:
+                return TagAliasMutationResult(True, [tag.value])
+
+            alias_group_key = tag.alias_group_key
+            await QuoteTag.filter(id=tag.id).using_db(connection).update(
+                alias_group_key=None
+            )
+            remaining = list(
+                await QuoteTag.filter(
+                    group_id=str(group_id), alias_group_key=alias_group_key
+                )
+                .using_db(connection)
+                .order_by("id")
+            )
+            if len(remaining) < 2:
+                await QuoteTag.filter(
+                    group_id=str(group_id), alias_group_key=alias_group_key
+                ).using_db(connection).update(alias_group_key=None)
+                return TagAliasMutationResult(True, [tag.value])
+            return TagAliasMutationResult(
+                True,
+                [tag.value, *(item.value for item in remaining)],
+            )
+
+    @classmethod
+    async def _resolve_exact_tag_ids(cls, group_id: str, value: str) -> list[int]:
+        tag = await QuoteTag.filter(
+            group_id=str(group_id),
+            normalized_value=cls.normalize_tag_value(value),
+        ).first()
+        if not tag:
+            return []
+        if tag.alias_group_key:
+            return list(
+                await QuoteTag.filter(
+                    group_id=str(group_id), alias_group_key=tag.alias_group_key
+                ).values_list("id", flat=True)
+            )
+        return [tag.id]
+
+    @classmethod
+    async def _resolve_exact_tag_normalized_values(
+        cls, group_id: str, value: str
+    ) -> set[str]:
+        tag = await QuoteTag.filter(
+            group_id=str(group_id),
+            normalized_value=cls.normalize_tag_value(value),
+        ).first()
+        if not tag:
+            return {cls.normalize_tag_value(value)}
+        if not tag.alias_group_key:
+            return {tag.normalized_value}
+        return set(
+            await QuoteTag.filter(
+                group_id=str(group_id), alias_group_key=tag.alias_group_key
+            ).values_list("normalized_value", flat=True)
+        )
+
+    @classmethod
+    async def _quote_ids_for_exact_tag(cls, group_id: str, value: str) -> set[int]:
+        tag_ids = await cls._resolve_exact_tag_ids(group_id, value)
+        if not tag_ids:
+            return set()
+        return set(
+            await QuoteTagLink.filter(tag_id__in=tag_ids).values_list(
+                "quote_id", flat=True
+            )
+        )
+
+    @classmethod
+    async def get_quote_ids_for_user(cls, group_id: str, user_id: str) -> list[int]:
+        quoted_ids = set(
+            await Quote.filter(
+                group_id=str(group_id), quoted_user_id=str(user_id)
+            ).values_list("id", flat=True)
+        )
+        tagged_ids = await cls._quote_ids_for_exact_tag(
+            str(group_id), cls.serialize_user_tag(str(user_id))
+        )
+        alias_values = await cls._resolve_exact_tag_normalized_values(
+            str(group_id), cls.serialize_user_tag(str(user_id))
+        )
+        legacy_tagged_ids = {
+            quote.id
+            for quote in await Quote.filter(
+                group_id=str(group_id), tag_schema_version=0
+            )
+            if str(getattr(quote, "quoted_user_id", "") or "") == str(user_id)
+            or any(
+                cls.normalize_tag_value(tag) in alias_values
+                for tag in cls.get_all_tags(quote)
+            )
+        }
+        return list(quoted_ids | tagged_ids | legacy_tagged_ids)
+
+    @classmethod
     def parse_user_tag(cls, tag: str) -> str | None:
         if not tag.startswith(cls._user_tag_prefix):
             return None
@@ -335,8 +713,9 @@ class QuoteService:
         user_tag = cls.serialize_user_tag(user_id)
         return user_tag in cls.get_all_tags(quote)
 
-    @staticmethod
+    @classmethod
     async def add_quote(
+        cls,
         group_id: str,
         image_path: str,
         ocr_content: str | None,
@@ -366,23 +745,31 @@ class QuoteService:
                     return existing_quote, False
 
             tags_source = ocr_content if ocr_content else recorded_text
-            tags = QuoteService.cut_sentence(tags_source) if tags_source else []
-            normalized_manual_tags = QuoteService.normalize_tags(manual_tags or [])
+            recognized_tags = cls.cut_sentence(tags_source) if tags_source else []
+            unified_tags = cls.normalize_tags(recognized_tags + (manual_tags or []))
 
-            relative_image_path = QuoteService.serialize_image_path(image_path)
+            relative_image_path = cls.serialize_image_path(image_path)
 
-            quote = await Quote.create(
-                group_id=group_id,
-                image_path=relative_image_path,
-                image_hash=image_hash,
-                ocr_text=ocr_content,
-                recorded_text=recorded_text,
-                tags=tags,
-                manual_tags=normalized_manual_tags,
-                quoted_user_id=quoted_user_id,
-                uploader_user_id=uploader_user_id,
-                view_count=0,
-            )
+            async with in_transaction() as connection:
+                quote = await Quote.create(
+                    using_db=connection,
+                    group_id=group_id,
+                    image_path=relative_image_path,
+                    image_hash=image_hash,
+                    ocr_text=ocr_content,
+                    recorded_text=recorded_text,
+                    tags=[],
+                    manual_tags=unified_tags,
+                    tag_schema_version=cls._tag_schema_version,
+                    quoted_user_id=quoted_user_id,
+                    uploader_user_id=uploader_user_id,
+                    view_count=0,
+                )
+                await cls._replace_quote_tag_links(
+                    quote,
+                    unified_tags,
+                    connection=connection,
+                )
 
             logger.info(f"语录添加成功 - ID: {quote.id}, 群组: {group_id}", "群聊语录")
             return quote, True
@@ -501,13 +888,13 @@ class QuoteService:
                 f"尝试随机获取语录 - 群组: {group_id}, 用户筛选: {user_id_filter}",
                 "群聊语录",
             )
-            quotes = list(await Quote.filter(group_id=group_id))
             if user_id_filter:
-                quotes = [
-                    quote
-                    for quote in quotes
-                    if cls._match_user_filter(quote, user_id_filter)
-                ]
+                candidate_ids = await cls.get_quote_ids_for_user(
+                    group_id, user_id_filter
+                )
+                quotes = await cls.get_quotes_by_ids_in_order(candidate_ids)
+            else:
+                quotes = list(await Quote.filter(group_id=group_id))
 
             count = len(quotes)
             if count == 0:
@@ -555,58 +942,194 @@ class QuoteService:
 
     @classmethod
     async def _search_quotes_by_text_and_filter_by_tags(
-        cls, group_id: str, keyword: str, user_id_filter: str | None = None
+        cls,
+        group_id: str,
+        keyword: str,
+        user_id_filter: str | None = None,
+        *,
+        tag_only: bool = False,
     ) -> list[Quote]:
-        """
-        分阶段搜索语录：
-        1. [精确匹配] 首先尝试匹配完整的关键词。
-        2. [模糊匹配] 如果没有精确匹配结果，则回退到分词模糊搜索。
-        """
-        base_filters = {"group_id": group_id}
-        candidate_quotes = list(await Quote.filter(**base_filters))
-        if user_id_filter:
-            candidate_quotes = [
+        """用数据库候选 ID 完成文本/tag 混合搜索，并兼容未迁移 JSON。"""
+        started_at = time.perf_counter()
+        keyword = keyword.strip()
+        if not keyword:
+            return []
+
+        exact_alias_values = await cls._resolve_exact_tag_normalized_values(
+            group_id, keyword
+        )
+
+        def legacy_exact_match(quote: Quote) -> bool:
+            alias_match = any(
+                cls.normalize_tag_value(tag) in exact_alias_values
+                for tag in cls.get_all_tags(quote)
+            )
+            return alias_match if tag_only else (
+                alias_match or cls._check_exact_keyword_in_quote(keyword, quote)
+            )
+
+        legacy_quotes = [
+            quote
+            for quote in await Quote.filter(group_id=group_id, tag_schema_version=0)
+            if not cls._uses_relation_tags(quote)
+        ]
+        if legacy_quotes and not hasattr(legacy_quotes[0], "tag_schema_version"):
+            candidate_quotes = legacy_quotes
+            if user_id_filter:
+                candidate_quotes = [
+                    quote
+                    for quote in candidate_quotes
+                    if cls._match_user_filter(quote, user_id_filter)
+                ]
+            exact_matches = [
                 quote
                 for quote in candidate_quotes
-                if cls._match_user_filter(quote, user_id_filter)
+                if legacy_exact_match(quote)
             ]
-        logger.debug(f"搜索候选语录共 {len(candidate_quotes)} 条", "群聊语录")
-        if not candidate_quotes:
-            return []
+            if exact_matches:
+                return exact_matches
+            if tag_only:
+                return []
+            tokens = cls.normalize_tags([*keyword.split(), *cls.cut_sentence(keyword)])
+            return [
+                quote
+                for quote in candidate_quotes
+                if all(cls._check_single_keyword_in_quote(token, quote) for token in tokens)
+            ]
 
-        logger.info(
-            f"第一阶段：尝试对 '{keyword}' 进行精确匹配搜索...", "群聊语录-搜索"
+        allowed_user_ids: set[int] | None = None
+        if user_id_filter:
+            allowed_user_ids = set(
+                await cls.get_quote_ids_for_user(group_id, user_id_filter)
+            )
+
+        exact_tag_ids = await cls._quote_ids_for_exact_tag(group_id, keyword)
+        fuzzy_tag_ids = (
+            set()
+            if tag_only
+            else set(
+                await QuoteTagLink.filter(
+                    tag__group_id=str(group_id),
+                    tag__normalized_value__contains=cls.normalize_tag_value(keyword),
+                ).values_list("quote_id", flat=True)
+            )
         )
-        # 精确阶段也必须把手动/自动 tag 视作同一检索池，否则一旦文本先命中，
-        # 手动 tag 命中的语录会被提前短路掉，表现上就像 manual_tags 没参与查询。
-        exact_matches = [
+        tag_candidate_ids = exact_tag_ids | fuzzy_tag_ids
+        text_candidate_ids: set[int] = set()
+        if not tag_only:
+            text_candidate_ids = set(
+                await Quote.filter(group_id=group_id)
+                .filter(
+                    Q(ocr_text__icontains=keyword)
+                    | Q(recorded_text__icontains=keyword)
+                )
+                .values_list("id", flat=True)
+            )
+
+        exact_candidate_ids = tag_candidate_ids | text_candidate_ids
+        if allowed_user_ids is not None:
+            exact_candidate_ids &= allowed_user_ids
+
+        legacy_matches = [
             quote
-            for quote in candidate_quotes
-            if cls._check_exact_keyword_in_quote(keyword, quote)
+            for quote in legacy_quotes
+            if legacy_exact_match(quote)
+            and (
+                allowed_user_ids is None
+                or quote.id in allowed_user_ids
+                or cls._match_user_filter(quote, user_id_filter)
+            )
         ]
 
-        if exact_matches:
-            logger.info(
-                f"精确匹配成功，找到 {len(exact_matches)} 条语录。", "群聊语录-搜索"
+        if exact_candidate_ids or legacy_matches or tag_only:
+            quotes = await cls.get_quotes_by_ids_in_order(
+                sorted(exact_candidate_ids, reverse=True)
             )
-            return exact_matches
+            result_by_id = {quote.id: quote for quote in [*quotes, *legacy_matches]}
+            result = list(result_by_id.values())
+            elapsed = time.perf_counter() - started_at
+            log_method = logger.warning if elapsed >= cls._slow_query_seconds else logger.debug
+            log_method(
+                "语录查询候选："
+                f"tag={len(tag_candidate_ids)} text={len(text_candidate_ids)} "
+                f"result={len(result)} elapsed={elapsed:.3f}s",
+                "群聊语录-搜索",
+            )
+            return result
 
-        logger.info("精确匹配未找到结果，回退到分词与 tag 综合搜索...", "群聊语录-搜索")
-        keywords = [k.strip() for k in keyword.split() if k.strip()]
-        if not keywords:
+        tokens = cls.normalize_tags([*keyword.split(), *cls.cut_sentence(keyword)])
+        if not tokens:
             return []
+        token_alias_values = [
+            await cls._resolve_exact_tag_normalized_values(group_id, token)
+            for token in tokens
+        ]
+        token_candidate_sets: list[set[int]] = []
+        for token in tokens:
+            exact_token_tag_ids = await cls._quote_ids_for_exact_tag(group_id, token)
+            token_tag_ids = set(
+                await QuoteTagLink.filter(
+                    tag__group_id=str(group_id),
+                    tag__normalized_value__contains=cls.normalize_tag_value(token),
+                ).values_list("quote_id", flat=True)
+            )
+            token_text_ids = set(
+                await Quote.filter(group_id=group_id)
+                .filter(
+                    Q(ocr_text__icontains=token)
+                    | Q(recorded_text__icontains=token)
+                )
+                .values_list("id", flat=True)
+            )
+            token_candidate_sets.append(
+                exact_token_tag_ids | token_tag_ids | token_text_ids
+            )
 
-        final_matches = []
-        for quote in candidate_quotes:
-            if all(cls._check_single_keyword_in_quote(kw, quote) for kw in keywords):
-                final_matches.append(quote)
-
-        logger.debug(f"经过最终过滤后，匹配到 {len(final_matches)} 条语录", "群聊语录")
-        return final_matches
+        candidate_ids = set.intersection(*token_candidate_sets) if token_candidate_sets else set()
+        if allowed_user_ids is not None:
+            candidate_ids &= allowed_user_ids
+        new_matches = await cls.get_quotes_by_ids_in_order(
+            sorted(candidate_ids, reverse=True)
+        )
+        legacy_fuzzy_matches = [
+            quote
+            for quote in legacy_quotes
+            if all(
+                cls._check_single_keyword_in_quote(token, quote)
+                or any(
+                    cls.normalize_tag_value(tag) in alias_values
+                    for tag in cls.get_all_tags(quote)
+                )
+                for token, alias_values in zip(
+                    tokens, token_alias_values, strict=True
+                )
+            )
+            and (
+                allowed_user_ids is None
+                or quote.id in allowed_user_ids
+                or cls._match_user_filter(quote, user_id_filter)
+            )
+        ]
+        result_by_id = {
+            quote.id: quote for quote in [*new_matches, *legacy_fuzzy_matches]
+        }
+        elapsed = time.perf_counter() - started_at
+        log_method = logger.warning if elapsed >= cls._slow_query_seconds else logger.debug
+        log_method(
+            f"语录查询候选：tokens={len(tokens)} result={len(result_by_id)} "
+            f"elapsed={elapsed:.3f}s",
+            "群聊语录-搜索",
+        )
+        return list(result_by_id.values())
 
     @classmethod
     async def search_quotes(
-        cls, group_id: str, keyword: str, user_id_filter: str | None = None
+        cls,
+        group_id: str,
+        keyword: str,
+        user_id_filter: str | None = None,
+        *,
+        tag_only: bool = False,
     ) -> list[Quote]:
         """根据关键词搜索语录并返回完整命中集。"""
         logger.info(
@@ -616,7 +1139,7 @@ class QuoteService:
 
         try:
             all_matches = await cls._search_quotes_by_text_and_filter_by_tags(
-                group_id, keyword, user_id_filter
+                group_id, keyword, user_id_filter, tag_only=tag_only
             )
             if all_matches:
                 logger.info(f"总共找到匹配的语录 {len(all_matches)} 条", "群聊语录")
@@ -883,6 +1406,8 @@ class QuoteService:
         history_index: int,
         keyword: str | None = None,
         user_id_filter: str | None = None,
+        *,
+        tag_only: bool = False,
     ) -> Quote | None:
         """按入库倒序获取第 N 条语录，可复用现有关键词与用户过滤语义。"""
         index = max(1, int(history_index))
@@ -891,16 +1416,16 @@ class QuoteService:
         try:
             if normalized_keyword:
                 quotes = await cls.search_quotes(
-                    group_id, normalized_keyword, user_id_filter
+                    group_id,
+                    normalized_keyword,
+                    user_id_filter,
+                    tag_only=tag_only,
                 )
             elif user_id_filter:
-                # 用户筛选需要兼容 quoted_user_id 与 user:<qq> tag，
-                # 继续沿用 Python 层判断。
-                quotes = [
-                    quote
-                    for quote in await Quote.filter(group_id=group_id)
-                    if cls._match_user_filter(quote, user_id_filter)
-                ]
+                candidate_ids = await cls.get_quote_ids_for_user(
+                    group_id, user_id_filter
+                )
+                quotes = await cls.get_quotes_by_ids_in_order(candidate_ids)
             else:
                 return (
                     await Quote.filter(group_id=group_id)
@@ -945,12 +1470,12 @@ class QuoteService:
 
     @classmethod
     async def add_manual_tags(cls, quote: Quote, tags: list[str]) -> TagMutationResult:
-        """为语录添加手动标签"""
-        original_tags = cls.get_manual_tags(quote)
+        """为语录添加统一标签；方法名保留用于兼容旧调用方。"""
+        original_tags = await cls.get_quote_tags(quote)
         try:
             normalized_tags = cls.normalize_tags(tags)
             logger.info(
-                f"为语录 ID: {quote.id} 添加手动标签: {normalized_tags}", "群聊语录"
+                f"为语录 ID: {quote.id} 添加 tag: {normalized_tags}", "群聊语录"
             )
 
             async with in_transaction() as connection:
@@ -961,25 +1486,62 @@ class QuoteService:
                     .using_db(connection)
                     .get()
                 )
-                current_tags = cls.get_manual_tags(locked_quote)
-                updated_tags = cls.normalize_tags(current_tags + normalized_tags)
-                changed_tags = [tag for tag in updated_tags if tag not in current_tags]
-                locked_quote.manual_tags = updated_tags
-                await locked_quote.save(
-                    using_db=connection,
-                    update_fields=["manual_tags"],
-                )
+                if not hasattr(locked_quote, "tag_schema_version"):
+                    current_tags = cls.get_manual_tags(locked_quote)
+                    updated_tags = cls.normalize_tags(current_tags + normalized_tags)
+                    changed_tags = [
+                        tag for tag in updated_tags if tag not in current_tags
+                    ]
+                    locked_quote.manual_tags = updated_tags
+                    await locked_quote.save(
+                        using_db=connection,
+                        update_fields=["manual_tags"],
+                    )
+                else:
+                    current_tags = await cls._migrate_locked_quote(
+                        locked_quote, connection
+                    )
+                    updated_tags = cls.normalize_tags(current_tags + normalized_tags)
+                    changed_tags = [
+                        tag for tag in updated_tags if tag not in current_tags
+                    ]
+                    for value in changed_tags:
+                        tag = await cls._get_or_create_tag(
+                            str(locked_quote.group_id),
+                            value,
+                            connection=connection,
+                        )
+                        await QuoteTagLink.get_or_create(
+                            quote_id=locked_quote.id,
+                            tag_id=tag.id,
+                            using_db=connection,
+                        )
+                    locked_quote.tags = []
+                    locked_quote.manual_tags = updated_tags
+                    locked_quote.tag_schema_version = cls._tag_schema_version
+                    await locked_quote.save(
+                        using_db=connection,
+                        update_fields=[
+                            "tags",
+                            "manual_tags",
+                            "tag_schema_version",
+                        ],
+                    )
 
             quote.manual_tags = updated_tags
+            if hasattr(quote, "tags"):
+                quote.tags = []
+            if hasattr(quote, "tag_schema_version"):
+                quote.tag_schema_version = cls._tag_schema_version
 
             logger.info(
-                f"语录 ID: {quote.id} 手动标签更新成功，现有标签: {updated_tags}",
+                f"语录 ID: {quote.id} tag 更新成功，现有标签: {updated_tags}",
                 "群聊语录",
             )
             return TagMutationResult(True, updated_tags, changed_tags)
         except Exception as e:
             logger.error(
-                f"为语录添加手动标签失败 - 语录 ID: {quote.id}, 错误: {e}",
+                f"为语录添加 tag 失败 - 语录 ID: {quote.id}, 错误: {e}",
                 "群聊语录",
                 e=e,
             )
@@ -997,12 +1559,15 @@ class QuoteService:
     async def delete_manual_tags(
         cls, quote: Quote, tags: list[str]
     ) -> TagMutationResult:
-        """删除语录的手动标签"""
-        original_tags = cls.get_manual_tags(quote)
+        """删除语录统一标签；互通成员按整组从当前语录移除。"""
+        original_tags = await cls.get_quote_tags(quote)
         try:
-            remove_tags = set(cls.normalize_tags(tags))
+            remove_values = cls.normalize_tags(tags)
+            remove_normalized = {
+                cls.normalize_tag_value(value) for value in remove_values
+            }
             logger.info(
-                f"从语录 ID: {quote.id} 删除手动标签: {list(remove_tags)}", "群聊语录"
+                f"从语录 ID: {quote.id} 删除 tag: {remove_values}", "群聊语录"
             )
             async with in_transaction() as connection:
                 # 删除也必须基于锁内最新值，否则会把同时新增的 tag 一并覆盖掉。
@@ -1012,25 +1577,96 @@ class QuoteService:
                     .using_db(connection)
                     .get()
                 )
-                current_tags = cls.get_manual_tags(locked_quote)
-                updated_tags = [tag for tag in current_tags if tag not in remove_tags]
-                changed_tags = [tag for tag in current_tags if tag in remove_tags]
-                locked_quote.manual_tags = updated_tags
-                await locked_quote.save(
-                    using_db=connection,
-                    update_fields=["manual_tags"],
-                )
+                if not hasattr(locked_quote, "tag_schema_version"):
+                    current_tags = cls.get_manual_tags(locked_quote)
+                    updated_tags = [
+                        tag
+                        for tag in current_tags
+                        if cls.normalize_tag_value(tag) not in remove_normalized
+                    ]
+                    changed_tags = [
+                        tag
+                        for tag in current_tags
+                        if cls.normalize_tag_value(tag) in remove_normalized
+                    ]
+                    locked_quote.manual_tags = updated_tags
+                    await locked_quote.save(
+                        using_db=connection,
+                        update_fields=["manual_tags"],
+                    )
+                else:
+                    current_tags = await cls._migrate_locked_quote(
+                        locked_quote, connection
+                    )
+                    requested_tags = list(
+                        await QuoteTag.filter(
+                            group_id=str(locked_quote.group_id),
+                            normalized_value__in=list(remove_normalized),
+                        ).using_db(connection)
+                    )
+                    alias_keys = {
+                        tag.alias_group_key
+                        for tag in requested_tags
+                        if tag.alias_group_key
+                    }
+                    removable_tag_ids = {tag.id for tag in requested_tags}
+                    if alias_keys:
+                        removable_tag_ids.update(
+                            await QuoteTag.filter(
+                                group_id=str(locked_quote.group_id),
+                                alias_group_key__in=list(alias_keys),
+                            )
+                            .using_db(connection)
+                            .values_list("id", flat=True)
+                        )
+                    linked_removals = list(
+                        await QuoteTag.filter(
+                            quote_links__quote_id=locked_quote.id,
+                            id__in=list(removable_tag_ids),
+                        )
+                        .using_db(connection)
+                        .values("id", "value")
+                    )
+                    changed_tags = [item["value"] for item in linked_removals]
+                    if removable_tag_ids:
+                        await QuoteTagLink.filter(
+                            quote_id=locked_quote.id,
+                            tag_id__in=list(removable_tag_ids),
+                        ).using_db(connection).delete()
+                    changed_normalized = {
+                        cls.normalize_tag_value(value) for value in changed_tags
+                    }
+                    updated_tags = [
+                        tag
+                        for tag in current_tags
+                        if cls.normalize_tag_value(tag) not in changed_normalized
+                    ]
+                    locked_quote.tags = []
+                    locked_quote.manual_tags = updated_tags
+                    locked_quote.tag_schema_version = cls._tag_schema_version
+                    await locked_quote.save(
+                        using_db=connection,
+                        update_fields=[
+                            "tags",
+                            "manual_tags",
+                            "tag_schema_version",
+                        ],
+                    )
 
             quote.manual_tags = updated_tags
+            if hasattr(quote, "tags"):
+                quote.tags = []
+            if hasattr(quote, "tag_schema_version"):
+                quote.tag_schema_version = cls._tag_schema_version
 
             logger.info(
-                f"语录 ID: {quote.id} 手动标签删除成功，现有标签: {updated_tags}",
+                f"语录 ID: {quote.id} tag 删除成功，现有标签: {updated_tags}",
                 "群聊语录",
             )
             return TagMutationResult(True, updated_tags, changed_tags)
         except Exception as e:
             logger.error(
-                f"删除语录手动标签失败 - 语录 ID: {quote.id}, 错误: {e}",
+                f"删除语录 tag 失败 - 语录 ID: {quote.id}, 错误: {e}",
                 "群聊语录",
                 e=e,
             )
@@ -1310,36 +1946,54 @@ class QuoteService:
         logger.info(f"开始使用HTML模板生成群组 {group_id} 的热门语录图片", "群聊语录")
 
         quote_cards_data = []
+        quoted_user_ids = list(
+            {
+                str(quote.quoted_user_id)
+                for quote in hottest_quotes
+                if quote.quoted_user_id
+            }
+        )
+        user_info_by_id = {
+            str(user_info.user_id): user_info
+            for user_info in await GroupInfoUser.filter(
+                group_id=str(group_id), user_id__in=quoted_user_ids
+            )
+        }
 
-        for i, quote in enumerate(hottest_quotes):
-            avatar_base64 = ""
-            if quote.quoted_user_id:
-                try:
+        avatar_semaphore = asyncio.Semaphore(5)
+
+        async def load_avatar(user_id: str | None) -> str:
+            if not user_id:
+                return ""
+            try:
+                async with avatar_semaphore:
                     avatar_path = await avatar_service.get_avatar_path(
-                        platform="qq", identifier=quote.quoted_user_id
+                        platform="qq", identifier=user_id
                     )
-                    if avatar_path:
-                        async with aiofiles.open(avatar_path, "rb") as f:
-                            avatar_data = await f.read()
-                        avatar_base64 = base64.b64encode(avatar_data).decode("utf-8")
-                except Exception as e:
-                    logger.warning(
-                        f"获取用户 {quote.quoted_user_id} 头像失败: {e}", "群聊语录"
-                    )
+                    if not avatar_path:
+                        return ""
+                    async with aiofiles.open(avatar_path, "rb") as avatar_file:
+                        avatar_data = await avatar_file.read()
+                    return base64.b64encode(avatar_data).decode("utf-8")
+            except Exception as e:
+                logger.warning(f"获取用户 {user_id} 头像失败: {e}", "群聊语录")
+                return ""
 
+        avatar_values = await asyncio.gather(
+            *(load_avatar(quote.quoted_user_id) for quote in hottest_quotes)
+        )
+
+        for i, (quote, avatar_base64) in enumerate(
+            zip(hottest_quotes, avatar_values, strict=True)
+        ):
             user_name = ""
             if quote.quoted_user_id:
-                user_info = await GroupInfoUser.get_or_none(
-                    user_id=quote.quoted_user_id, group_id=quote.group_id
+                user_info = user_info_by_id.get(str(quote.quoted_user_id))
+                user_name = (
+                    user_info.user_name
+                    if user_info and user_info.user_name
+                    else quote.quoted_user_id
                 )
-                if user_info:
-                    user_name = (
-                        user_info.user_name
-                        or user_info.nickname
-                        or quote.quoted_user_id
-                    )
-                else:
-                    user_name = quote.quoted_user_id
 
             is_image_quote = quote.image_path and not (
                 quote.ocr_text or quote.recorded_text
@@ -1432,17 +2086,24 @@ class QuoteService:
         ]
         counts = [item.get("upload_count") or item.get("quote_count") for item in data]
 
-        user_names = []
-        for uid in user_ids:
-            if not uid:
-                user_names.append("未知用户")
-                continue
-            user_info = await GroupInfoUser.get_or_none(
-                group_id=group_id, user_id=str(uid)
+        valid_user_ids = [str(uid) for uid in user_ids if uid]
+        user_info_by_id = {
+            str(user_info.user_id): user_info
+            for user_info in await GroupInfoUser.filter(
+                group_id=str(group_id), user_id__in=valid_user_ids
             )
-            user_names.append(
-                user_info.user_name if user_info and user_info.user_name else str(uid)
+        }
+        user_names = [
+            "未知用户"
+            if not uid
+            else (
+                user_info_by_id[str(uid)].user_name
+                if str(uid) in user_info_by_id
+                and user_info_by_id[str(uid)].user_name
+                else str(uid)
             )
+            for uid in user_ids
+        ]
 
         user_names.reverse()
         counts.reverse()

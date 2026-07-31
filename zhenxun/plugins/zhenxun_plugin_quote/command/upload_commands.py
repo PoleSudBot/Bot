@@ -584,7 +584,10 @@ def _build_upload_success_message(
 ) -> list[bytes | str]:
     success_text = "\n保存成功\n"
     if missing_auto_tags:
-        success_text += "未识别到文字标签，图片已直接保存。\n"
+        success_text += (
+            "未识别到可用 tag，语录已保存；可回复本条语录发送"
+            "「tag add 标签」补充。\n"
+        )
     return [img_data, success_text, _build_basic_usage_hint_text()]
 
 
@@ -904,7 +907,7 @@ async def _process_upload_image(
             return _UploadImageResult(
                 status="success",
                 image_data=img_data,
-                missing_auto_tags=not QuoteService.get_auto_tags(quote),
+                missing_auto_tags=not await QuoteService.get_quote_tags(quote),
             )
         if quote and not is_new:
             return _UploadImageResult(status="duplicate")
@@ -943,7 +946,8 @@ def _build_batch_upload_summary(results: list[_UploadImageResult]) -> str:
         lines.append(f"失败明细：{details}")
     if missing_auto_tags_count:
         lines.append(
-            f"其中 {missing_auto_tags_count} 张未识别到文字标签，已直接保存。"
+            f"其中 {missing_auto_tags_count} 张未识别到可用 tag，已保存；"
+            "可回复对应语录使用「tag add 标签」补充。"
         )
     return "\n".join(lines)
 

@@ -53,7 +53,10 @@ class Quote(Model):
     """标签列表"""
 
     manual_tags = fields.JSONField(default=list)
-    """手动维护的标签列表"""
+    """统一标签的旧格式兼容镜像"""
+
+    tag_schema_version = fields.IntField(default=0)
+    """标签存储版本，0 为旧 JSON，1 为关联表"""
 
     quoted_user_id = fields.CharField(max_length=64, null=True, index=True)
     """被记录用户的QQ号"""
@@ -76,7 +79,46 @@ class Quote(Model):
         return [
             "ALTER TABLE quote ADD COLUMN manual_tags TEXT;",
             "UPDATE quote SET manual_tags = '[]' WHERE manual_tags IS NULL;",
+            "ALTER TABLE quote ADD COLUMN tag_schema_version INT NOT NULL DEFAULT 0;",
         ]
+
+
+class QuoteTag(Model):
+    """群内唯一的标签词条。"""
+
+    id = fields.IntField(pk=True, generated=True)
+    group_id = fields.CharField(max_length=64)
+    value = fields.CharField(max_length=255)
+    normalized_value = fields.CharField(max_length=255)
+    alias_group_key = fields.CharField(max_length=32, null=True)
+
+    class Meta:
+        table = "quote_tag"
+        table_description = "语录标签词条表"
+        unique_together = (("group_id", "normalized_value"),)
+        indexes = (("group_id", "alias_group_key"),)
+
+
+class QuoteTagLink(Model):
+    """语录与标签的多对多关系。"""
+
+    id = fields.IntField(pk=True, generated=True)
+    quote = fields.ForeignKeyField(
+        "models.Quote",
+        related_name="tag_links",
+        on_delete=fields.CASCADE,
+    )
+    tag = fields.ForeignKeyField(
+        "models.QuoteTag",
+        related_name="quote_links",
+        on_delete=fields.CASCADE,
+    )
+
+    class Meta:
+        table = "quote_tag_link"
+        table_description = "语录标签关联表"
+        unique_together = (("quote", "tag"),)
+        indexes = (("quote_id",), ("tag_id",))
 
 
 class QuotedReplyData(BaseModel):

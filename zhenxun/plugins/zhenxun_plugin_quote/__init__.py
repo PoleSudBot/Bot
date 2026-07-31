@@ -1,4 +1,5 @@
 from nonebot.plugin import PluginMetadata
+import asyncio
 
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from pathlib import Path
@@ -16,10 +17,22 @@ from .command.upload_commands import (  # noqa: F401
 )
 from .config import ensure_quote_path
 from zhenxun.services import renderer_service
+from .services.quote_service import QuoteService
 
 ensure_quote_path()
 
 QUOTE_ASSETS_PATH = Path(__file__).parent / "templates"
+_tag_migration_task: asyncio.Task[int] | None = None
+
+
+def _log_tag_migration_result(task: asyncio.Task[int]) -> None:
+    try:
+        migrated = task.result()
+        logger.info(f"统一 tag 后台迁移完成，共迁移 {migrated} 条。", "群聊语录")
+    except asyncio.CancelledError:
+        logger.info("统一 tag 后台迁移已取消。", "群聊语录")
+    except Exception as e:
+        logger.error(f"统一 tag 后台迁移失败: {e}", "群聊语录", e=e)
 
 
 @PriorityLifecycle.on_startup(priority=9)
@@ -33,6 +46,11 @@ async def _init_quote_services():
         logger.info("语录插件模板命名空间 '@quote' 注册成功。", "群聊语录")
     except Exception as e:
         logger.error(f"注册语录插件模板命名空间失败: {e}", "群聊语录", e=e)
+
+    global _tag_migration_task
+    if _tag_migration_task is None or _tag_migration_task.done():
+        _tag_migration_task = asyncio.create_task(QuoteService.migrate_legacy_tags())
+        _tag_migration_task.add_done_callback(_log_tag_migration_result)
 
 __plugin_meta__ = PluginMetadata(
     name="群聊语录",
@@ -67,10 +85,13 @@ __plugin_meta__ = PluginMetadata(
         "### 管理功能\n"
         "`删除` - 回复 Bot 发出的单图、多图或合并转发语录后删除，需为上传者或满足删除权限\n"
         "`删除语录` / `del` - 回复语录图片或合并转发后删除对应语录，需满足删除权限\n\n"
-        "`tag` - 回复语录图片后查看自动与手动 tag（多图按 1.、2.、3. 编号）\n"
+        "`tag` - 回复语录图片后查看统一 tag（多图按 1.、2.、3. 编号）\n"
         "`tag all` / `alltag` - `tag` 的兼容写法，查看相同的全部 tag\n"
-        "`tag add` / `tag del` - 为回复中的全部语录图片添加或删除手动 tag\n"
+        "`tag add` / `tag del` - 为回复中的全部语录图片添加或删除 tag\n"
         "`addtag` / `deltag` / `tagadd` / `tagdel` - `tag add/del` 的等价别名\n\n"
+        "`taglink tag1 tag2 ...` - 创建或扩展当前群互通组，别名：`tag互通`、`标签互通`\n"
+        "`tagunlink tag` - 将一个成员移出互通组，别名：`取消互通`\n"
+        "`taggroup tag` - 查看成员所在互通组，别名：`tag组`、`互通组`\n\n"
         "`语录管理 keyword 词1 ...` - 删除包含任一关键词的语录，仅超级用户可用\n"
         "`语录管理 clear --uploader @用户/QQ号` - 清空指定上传者的语录，仅超级用户可用\n"
         "`语录管理 clear --quoted @用户/QQ号` - 清空指定被记录用户的语录，仅超级用户可用\n"
@@ -86,14 +107,15 @@ __plugin_meta__ = PluginMetadata(
         "`语录` 一次最多获取 10 张；1-5 张会合并成一条消息，6-10 张会使用合并转发\n"
         "`tag` 系列只在回复语录图或合并转发时生效，非回复场景会静默让路；反馈只发送文字，不重复原图\n"
         "`删除` 只在回复语录图或合并转发时有效，不会接管普通聊天里的“删除”\n"
-        "手动 tag 与 OCR/AI/记录文本生成的自动 tag 分层存储，但查询时会合并匹配"
+        "OCR/AI、记录文本和用户添加的 tag 完全同权，可直接查询、添加和删除；"
+        "使用 `语录 #tag` 可进行严格 tag 查询"
     ),
     type="application",
     homepage="https://github.com/webjoin111/zhenxun_plugin_quote",
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="v1.3.0",
+        version="v1.4.0",
         admin_level=0,
         configs=[
             RegisterConfig(
@@ -202,6 +224,13 @@ __plugin_meta__ = PluginMetadata(
                 key="DELETE_ADMIN_LEVEL",
                 value=5,
                 help="设置使用「删除」命令所需的权限等级。默认值为5，允许群管理员使用。",
+                default_value=5,
+            ),
+            RegisterConfig(
+                module="quote",
+                key="TAG_ALIAS_ADMIN_LEVEL",
+                value=5,
+                help="设置管理 tag 互通组所需的权限等级。默认值为5，允许群管理员使用。",
                 default_value=5,
             ),
             RegisterConfig(

@@ -341,7 +341,7 @@ async def _require_reply_quotes(
     return None
 
 
-def _build_tag_view_message(
+async def _build_tag_view_message(
     quotes: Quote | list[Quote], show_all: bool = True
 ) -> list[object]:
     quote_list = _as_quotes(quotes)
@@ -351,16 +351,18 @@ def _build_tag_view_message(
             message.append("\n")
         if len(quote_list) > 1:
             message.append(f"{index}. ")
-        message.extend(
-            [
-                "自动 tag：",
-                *QuoteService.format_tags_for_message(QuoteService.get_auto_tags(quote)),
-                "\n手动 tag：",
-                *QuoteService.format_tags_for_message(
-                    QuoteService.get_manual_tags(quote)
-                ),
-            ]
-        )
+        message.append("tag：")
+        tag_groups = await QuoteService.get_quote_tag_groups(quote)
+        if not tag_groups:
+            message.append("无")
+            continue
+        for group_index, members in enumerate(tag_groups):
+            if group_index:
+                message.append(" ")
+            for member_index, member in enumerate(members):
+                if member_index:
+                    message.append(" = ")
+                message.extend(QuoteService.format_tags_for_message([member]))
     return message or ["没有可显示的 tag。"]
 
 
@@ -371,7 +373,7 @@ async def _show_quote_tags(
     show_all: bool = True,
     unresolved_count: int = 0,
 ):
-    message = _build_tag_view_message(quotes, show_all=show_all)
+    message = await _build_tag_view_message(quotes, show_all=show_all)
     if unresolved_count:
         message.append(f"\n未识别图片/转发节点：{unresolved_count}")
     await MessageUtils.build_message(
@@ -406,35 +408,35 @@ async def _update_quote_manual_tags(
     if len(quote_list) == 1:
         result = results[0]
         if not result.success:
-            await MessageUtils.build_message("修改手动 tag 失败，请稍后再试。").send(
+            await MessageUtils.build_message("修改 tag 失败，请稍后再试。").send(
                 target=event, bot=bot
             )
             return
         changed_tags = result.changed_tags
         if action == "add":
-            prefix = "已添加手动 tag：" if changed_tags else "这些手动 tag 已经都在了："
+            prefix = "已添加 tag：" if changed_tags else "这些 tag 已经都在了："
         else:
             prefix = (
-                "已删除手动 tag："
+                "已删除 tag："
                 if changed_tags
-                else "这些手动 tag 当前都不存在："
+                else "这些 tag 当前都不存在："
             )
         display_tags = changed_tags or normalized_tags
         message = [
             prefix,
             *QuoteService.format_tags_for_message(display_tags),
-            "\n当前手动 tag：",
+            "\n当前 tag：",
             *QuoteService.format_tags_for_message(result.tags),
         ]
     else:
         action_text = "添加" if action == "add" else "删除"
         success_count = sum(result.success for result in results)
         message = [
-            f"已为 {success_count}/{len(quote_list)} 条语录{action_text}手动 tag："
+            f"已为 {success_count}/{len(quote_list)} 条语录{action_text} tag："
         ]
         message.extend(QuoteService.format_tags_for_message(normalized_tags))
         for index, result in enumerate(results, start=1):
-            message.append(f"\n{index}. 当前手动 tag：")
+            message.append(f"\n{index}. 当前 tag：")
             message.extend(
                 QuoteService.format_tags_for_message(
                     result.tags if result.success else []
@@ -578,6 +580,24 @@ quote_deltag_cmd = on_alconna(
     block=True,
     rule=reply_to_quote_rule(),
 )
+quote_taglink_cmd = on_alconna(
+    Alconna("taglink", Args["parts", MultiVar(At | Text)]),
+    aliases={"tag互通", "标签互通"},
+    priority=4,
+    block=True,
+)
+quote_tagunlink_cmd = on_alconna(
+    Alconna("tagunlink", Args["parts", MultiVar(At | Text)]),
+    aliases={"取消互通"},
+    priority=4,
+    block=True,
+)
+quote_taggroup_cmd = on_alconna(
+    Alconna("taggroup", Args["parts", MultiVar(At | Text)]),
+    aliases={"tag组", "互通组"},
+    priority=4,
+    block=True,
+)
 
 
 @delete_quote_reply_cmd.handle()
@@ -714,6 +734,126 @@ async def handle_quote_deltag(
         action="del",
         unresolved_count=resolution.unresolved_count,
     )
+
+
+def _format_alias_group_message(members: list[str]) -> list[object]:
+    message: list[object] = []
+    for index, member in enumerate(members):
+        if index:
+            message.append(" = ")
+        message.extend(QuoteService.format_tags_for_message([member]))
+    return message or ["无"]
+
+
+async def _require_alias_admin(
+    bot: Bot, event: MessageEvent, session: Uninfo
+) -> bool:
+    if not session.group:
+        await MessageUtils.build_message("tag 互通命令仅支持群聊。").send(
+            target=event, bot=bot
+        )
+        return False
+    if not await admin_check("quote", "TAG_ALIAS_ADMIN_LEVEL")(bot, event, session):
+        return False
+    return True
+
+
+@quote_taglink_cmd.handle()
+async def handle_quote_taglink(
+    bot: Bot, event: MessageEvent, arp: Arparma, session: Uninfo
+):
+    if not await _require_alias_admin(bot, event, session):
+        return
+    group_id = str(session.group.id)
+    values = extract_manual_tags(arp)
+    preview = await QuoteService.preview_tag_alias_link(group_id, values)
+    if not preview.success:
+        await MessageUtils.build_message(
+            "请提供至少两个 tag 或 @用户，例如：taglink xc 小葱 @用户"
+        ).send(target=event, bot=bot)
+        return
+
+    confirm_merge = False
+    if preview.requires_confirmation:
+        original_session_id = event.get_session_id()
+        original_user_id = str(event.get_user_id())
+        message = ["将合并多个现有互通组：", *_format_alias_group_message(preview.members)]
+        message.append("\n确认请在 30 秒内回复“是”。")
+        await MessageUtils.build_message(message).send(target=event, bot=bot)
+
+        @waiter(waits=["message"], keep_session=True)
+        async def check_confirm(confirm_event: MessageEvent):
+            if (
+                confirm_event.get_session_id() != original_session_id
+                or str(confirm_event.get_user_id()) != original_user_id
+            ):
+                return None
+            return confirm_event.get_plaintext().strip()
+
+        reply_text = await check_confirm.wait(timeout=30)
+        if reply_text != "是":
+            await MessageUtils.build_message("操作已取消。").send(
+                target=event, bot=bot
+            )
+            return
+        confirm_merge = True
+
+    result = await QuoteService.link_tag_aliases(
+        group_id, values, confirm_merge=confirm_merge
+    )
+    await MessageUtils.build_message(
+        ["互通组：", *_format_alias_group_message(result.members)]
+    ).send(target=event, bot=bot)
+
+
+@quote_tagunlink_cmd.handle()
+async def handle_quote_tagunlink(
+    bot: Bot, event: MessageEvent, arp: Arparma, session: Uninfo
+):
+    if not await _require_alias_admin(bot, event, session):
+        return
+    group_id = str(session.group.id)
+    values = extract_manual_tags(arp)
+    if len(values) != 1:
+        await MessageUtils.build_message(
+            "请只提供一个要取消互通的 tag 或 @用户。"
+        ).send(target=event, bot=bot)
+        return
+    result = await QuoteService.unlink_tag_alias(group_id, values[0])
+    if not result.success:
+        await MessageUtils.build_message("该 tag 尚不存在。").send(
+            target=event, bot=bot
+        )
+        return
+    await MessageUtils.build_message(
+        ["已取消互通：", *QuoteService.format_tags_for_message([values[0]])]
+    ).send(target=event, bot=bot)
+
+
+@quote_taggroup_cmd.handle()
+async def handle_quote_taggroup(
+    bot: Bot, event: MessageEvent, arp: Arparma, session: Uninfo
+):
+    if not session.group:
+        await MessageUtils.build_message("tag 互通命令仅支持群聊。").send(
+            target=event, bot=bot
+        )
+        return
+    values = extract_manual_tags(arp)
+    if len(values) != 1:
+        await MessageUtils.build_message("请只提供一个 tag 或 @用户。").send(
+            target=event, bot=bot
+        )
+        return
+    members = await QuoteService.get_tag_alias_group(str(session.group.id), values[0])
+    if not members:
+        await MessageUtils.build_message("该 tag 尚不存在。").send(
+            target=event, bot=bot
+        )
+        return
+    await MessageUtils.build_message(
+        ["互通组：", *_format_alias_group_message(members)]
+    ).send(target=event, bot=bot)
 
 
 quote_manage_cmd = on_alconna(
