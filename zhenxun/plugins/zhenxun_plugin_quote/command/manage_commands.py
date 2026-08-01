@@ -184,7 +184,11 @@ async def _get_images_from_reply(
 
 
 async def _get_quotes_from_reply(
-    bot: Bot, event: MessageEvent, session: Uninfo
+    bot: Bot,
+    event: MessageEvent,
+    session: Uninfo,
+    *,
+    recycled_only: bool = False,
 ) -> ReplyQuoteResolution:
     if not session.group or not await is_reply_to_bot(event):
         return ReplyQuoteResolution([])
@@ -199,10 +203,15 @@ async def _get_quotes_from_reply(
             unresolved_count += 1
             continue
 
+        lookup_kwargs = {
+            "reply_image_md5": image_md5,
+            "reply_image_basename": image_basename,
+        }
+        if recycled_only:
+            lookup_kwargs["recycled_only"] = True
         quote = await QuoteService.find_quote_by_reply_image(
             session.group.id,
-            reply_image_md5=image_md5,
-            reply_image_basename=image_basename,
+            **lookup_kwargs,
         )
         if not quote:
             unresolved_count += 1
@@ -253,6 +262,20 @@ async def uploader_or_admin_check(
         if quote and quote.uploader_user_id == user_id:
             return True
     return False
+
+
+async def deleter_or_admin_check(
+    bot: Bot,
+    event: MessageEvent,
+    session: Uninfo,
+    quote: Quote,
+) -> bool:
+    """仅允许原删除者或当前满足删除权限的管理员恢复语录。"""
+    if await admin_check("quote", "DELETE_ADMIN_LEVEL")(bot, event, session):
+        return True
+    return str(getattr(quote, "deleted_by_user_id", "") or "") == str(
+        session.user.id
+    )
 
 
 async def is_reply_to_bot(event: Event) -> bool:
@@ -342,10 +365,46 @@ async def _require_reply_quotes(
 
 
 async def _build_tag_view_message(
-    quotes: Quote | list[Quote], show_all: bool = True
+    quotes: Quote | list[Quote],
+    show_all: bool = True,
+    *,
+    bot: Bot | None = None,
 ) -> list[object]:
     quote_list = _as_quotes(quotes)
     message: list[object] = []
+    uploader_names: dict[tuple[str, str], str] = {}
+
+    async def resolve_uploader_name(quote: Quote) -> str:
+        uploader_user_id = str(getattr(quote, "uploader_user_id", "") or "").strip()
+        if not uploader_user_id:
+            return "未知"
+
+        group_id = str(getattr(quote, "group_id", "") or "").strip()
+        cache_key = (group_id, uploader_user_id)
+        if cache_key in uploader_names:
+            return uploader_names[cache_key]
+
+        display_name = uploader_user_id
+        if bot and group_id:
+            try:
+                member_info = await bot.get_group_member_info(
+                    group_id=int(group_id),
+                    user_id=int(uploader_user_id),
+                )
+                if isinstance(member_info, dict):
+                    display_name = str(
+                        member_info.get("card")
+                        or member_info.get("nickname")
+                        or uploader_user_id
+                    ).strip()
+            except Exception as e:
+                logger.debug(
+                    f"获取语录上传者群名片失败，将回退 QQ 号: {e}", "群聊语录"
+                )
+
+        uploader_names[cache_key] = display_name
+        return display_name
+
     for index, quote in enumerate(quote_list, start=1):
         if index > 1:
             message.append("\n")
@@ -355,18 +414,27 @@ async def _build_tag_view_message(
         tag_groups = await QuoteService.get_quote_tag_groups(quote)
         if not tag_groups:
             message.append("无")
-            continue
-        for group_index, members in enumerate(tag_groups):
-            if group_index:
-                message.append("；")
-            message.extend(QuoteService.format_tags_for_message([members[0]]))
-            if len(members) > 1:
-                message.append("（")
-                for member_index, member in enumerate(members[1:]):
-                    if member_index:
-                        message.append("、")
-                    message.extend(QuoteService.format_tags_for_message([member]))
-                message.append("）")
+        else:
+            for group_index, members in enumerate(tag_groups):
+                if group_index:
+                    message.append("；")
+                message.extend(QuoteService.format_tags_for_message([members[0]]))
+                if len(members) > 1:
+                    message.append("（")
+                    for member_index, member in enumerate(members[1:]):
+                        if member_index:
+                            message.append("、")
+                        message.extend(QuoteService.format_tags_for_message([member]))
+                    message.append("）")
+
+        uploader_user_id = str(getattr(quote, "uploader_user_id", "") or "").strip()
+        uploader_name = await resolve_uploader_name(quote)
+        message.append("\n上传者：")
+        message.append(
+            f"{uploader_name}（{uploader_user_id}）"
+            if uploader_user_id and uploader_name != uploader_user_id
+            else uploader_name
+        )
     return message or ["没有可显示的 tag。"]
 
 
@@ -377,7 +445,7 @@ async def _show_quote_tags(
     show_all: bool = True,
     unresolved_count: int = 0,
 ):
-    message = await _build_tag_view_message(quotes, show_all=show_all)
+    message = await _build_tag_view_message(quotes, show_all=show_all, bot=bot)
     if unresolved_count:
         message.append(f"\n未识别图片/转发节点：{unresolved_count}")
     await MessageUtils.build_message(
@@ -506,21 +574,81 @@ async def _handle_delete_reply_quote(
 
     deleted_count = 0
     for item in quotes:
-        if await QuoteService.delete_quote_instance(item):
+        if await QuoteService.delete_quote_instance(
+            item,
+            deleted_by_user_id=str(user_id),
+        ):
             deleted_count += 1
 
     if deleted_count == len(quotes):
-        message = [At(target=user_id, flag="user"), f" 删除成功，共 {deleted_count} 条"]
+        message = [
+            At(target=user_id, flag="user"),
+            (
+                f" 已移入回收站，共 {deleted_count} 条；7 日后彻底删除；"
+                "回复原语录发送「恢复语录」可恢复"
+            ),
+        ]
+    else:
+        status_text = (
+            f" 删除完成：成功 {deleted_count} 条，"
+            f"失败 {len(quotes) - deleted_count} 条"
+        )
+        if deleted_count:
+            status_text += (
+                "；成功项已移入回收站，"
+                "回复原语录发送「恢复语录」可恢复"
+            )
+        message = [
+            At(target=user_id, flag="user"),
+            status_text,
+        ]
+    if unresolved_count:
+        message.append(f"；未识别图片/转发节点：{unresolved_count}")
+    await MessageUtils.build_message(message).send(target=event, bot=bot)
+
+
+async def _handle_restore_reply_quote(
+    bot: Bot,
+    event: MessageEvent,
+    session: Uninfo,
+    resolution: ReplyQuoteResolution,
+):
+    user_id = str(session.user.id)
+    quotes = resolution.quotes
+    authorized = [
+        await deleter_or_admin_check(bot, event, session, quote=item)
+        for item in quotes
+    ]
+    if not all(authorized):
+        unauthorized_count = authorized.count(False)
+        await MessageUtils.build_message(
+            [
+                At(target=user_id, flag="user"),
+                f" 其中 {unauthorized_count} 条语录无恢复权限，已取消整批恢复",
+            ]
+        ).send(target=event, bot=bot)
+        return
+
+    restored_count = 0
+    for item in quotes:
+        if await QuoteService.restore_quote_instance(item):
+            restored_count += 1
+
+    if restored_count == len(quotes):
+        message: list[object] = [
+            At(target=user_id, flag="user"),
+            f" 恢复成功，共 {restored_count} 条",
+        ]
     else:
         message = [
             At(target=user_id, flag="user"),
             (
-                f" 删除完成：成功 {deleted_count} 条，"
-                f"失败 {len(quotes) - deleted_count} 条"
+                f" 恢复完成：成功 {restored_count} 条，"
+                f"失败 {len(quotes) - restored_count} 条"
             ),
         ]
-    if unresolved_count:
-        message.append(f"；未识别图片/转发节点：{unresolved_count}")
+    if resolution.unresolved_count:
+        message.append(f"；未识别图片/转发节点：{resolution.unresolved_count}")
     await MessageUtils.build_message(message).send(target=event, bot=bot)
 
 
@@ -538,11 +666,21 @@ async def _handle_delete_last_quote(bot: Bot, event: MessageEvent, session: Unin
         return
 
     image_basename = os.path.basename(quote.image_path)
-    is_deleted = await QuoteService.delete_quote(group_id, image_basename)
+    is_deleted = await QuoteService.delete_quote(
+        group_id,
+        image_basename,
+        deleted_by_user_id=str(user_id),
+    )
 
     if is_deleted:
         await MessageUtils.build_message(
-            [At(target=user_id, flag="user"), " 成功删除本群上一条语录"]
+            [
+                At(target=user_id, flag="user"),
+                (
+                    " 已将本群上一条语录移入回收站，7 日后彻底删除；"
+                    "回复原语录发送「恢复语录」可恢复"
+                ),
+            ]
         ).send()
         return
 
@@ -560,6 +698,9 @@ delete_quote_reply_cmd = on_message(
 )
 delete_quote_cmd = on_alconna(
     Alconna("删除语录"), aliases={"del"}, priority=11, block=True
+)
+restore_quote_cmd = on_alconna(
+    Alconna("恢复语录"), priority=4, block=True
 )
 quote_tag_cmd = on_alconna(
     Alconna("tag", Args["action?", str]["parts?", MultiVar(At | Text)]),
@@ -639,6 +780,34 @@ async def handle_delete_quote_standalone(
         target=event,
         bot=bot,
     )
+
+
+@restore_quote_cmd.handle()
+async def handle_restore_quote(
+    bot: Bot,
+    event: MessageEvent,
+    session: Uninfo,
+):
+    if not session.group:
+        await MessageUtils.build_message("恢复语录仅支持群聊。").send(
+            target=event,
+            bot=bot,
+        )
+        return
+
+    resolution = await _get_quotes_from_reply(
+        bot,
+        event,
+        session,
+        recycled_only=True,
+    )
+    if not resolution.quotes:
+        await MessageUtils.build_message(
+            "请回复已移入回收站的语录图片或合并转发后再使用此命令。"
+        ).send(target=event, bot=bot)
+        return
+
+    await _handle_restore_reply_quote(bot, event, session, resolution)
 
 
 @quote_tag_cmd.handle()
@@ -1149,7 +1318,10 @@ async def handle_adv_delete(
 
         for quote in matched_quotes:
             try:
-                if await QuoteService.delete_quote_instance(quote):
+                if await QuoteService.delete_quote_instance(
+                    quote,
+                    deleted_by_user_id=current_user_id,
+                ):
                     deleted_count += 1
                 else:
                     failed_count += 1
@@ -1162,7 +1334,10 @@ async def handle_adv_delete(
                 )
                 failed_count += 1
 
-        result_msg = f"语录删除完成，成功: {deleted_count}，失败: {failed_count}"
+        result_msg = (
+            f"语录已移入回收站，成功: {deleted_count}，失败: {failed_count}；"
+            "7 日后彻底删除；回复原语录发送「恢复语录」可恢复"
+        )
         await MessageUtils.build_message(result_msg).send(
             target=target_for_reply, bot=bot
         )

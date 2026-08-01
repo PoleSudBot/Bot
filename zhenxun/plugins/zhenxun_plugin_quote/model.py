@@ -67,6 +67,12 @@ class Quote(Model):
     created_at = fields.DatetimeField(auto_now_add=True)
     """创建时间"""
 
+    deleted_at = fields.DatetimeField(null=True, index=True)
+    """移入回收站的时间，空值表示正常语录"""
+
+    deleted_by_user_id = fields.CharField(max_length=64, null=True)
+    """执行删除操作的用户QQ号"""
+
     view_count = fields.IntField(default=0)
     """查看次数"""
 
@@ -80,6 +86,9 @@ class Quote(Model):
             "ALTER TABLE quote ADD COLUMN manual_tags TEXT;",
             "UPDATE quote SET manual_tags = '[]' WHERE manual_tags IS NULL;",
             "ALTER TABLE quote ADD COLUMN tag_schema_version INT NOT NULL DEFAULT 0;",
+            "ALTER TABLE quote ADD COLUMN deleted_at TIMESTAMP NULL;",
+            "ALTER TABLE quote ADD COLUMN deleted_by_user_id VARCHAR(64) NULL;",
+            "CREATE INDEX quote_deleted_at_idx ON quote (deleted_at);",
         ]
 
 

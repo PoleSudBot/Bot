@@ -222,7 +222,7 @@ def _build_search_memory_key(
 
 async def _get_empty_quote_library_message(group_id: str) -> str:
     """区分数据库真空和有记录但图片均不可用两种状态。"""
-    if await Quote.filter(group_id=group_id).exists():
+    if await QuoteService.active_quotes(group_id=group_id).exists():
         return "语录记录存在，但图片暂时不可用，请联系管理员检查。"
     return "当前无语录库"
 

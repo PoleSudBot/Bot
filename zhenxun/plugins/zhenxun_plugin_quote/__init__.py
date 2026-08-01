@@ -1,10 +1,12 @@
 from nonebot.plugin import PluginMetadata
+from nonebot.adapters import Bot
 import asyncio
 
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from pathlib import Path
 from zhenxun.configs.utils import PluginExtraData, RegisterConfig
 from zhenxun.services.log import logger
+from zhenxun.services.scheduler import ScheduleContext, Trigger, scheduler_manager
 from .command.manage_commands import quote_manage_cmd  # noqa: F401
 from .command.query_commands import (  # noqa: F401
     quote_stats_cmd,
@@ -82,9 +84,12 @@ __plugin_meta__ = PluginMetadata(
         "`语录统计 [热门/高产上传/高产被录] [数量]` - 查看群内语录统计\n"
         "示例：`语录统计 热门`、`语录统计 高产上传 5`、`quote stats 热门 10`\n\n"
         "### 管理功能\n"
-        "`删除` - 回复 Bot 发出的单图、多图或合并转发语录后删除，需为上传者或满足删除权限\n"
-        "`删除语录` / `del` - 回复语录图片或合并转发后删除对应语录，需满足删除权限\n\n"
-        "`tag` - 回复语录图片后查看统一 tag（多图按 1.、2.、3. 编号）\n"
+        "`删除` - 回复 Bot 发出的单图、多图或合并转发语录后移入回收站，"
+        "需为上传者或满足删除权限\n"
+        "`删除语录` / `del` - `删除` 的兼容写法；回收站语录保留 7 日后彻底删除\n"
+        "`恢复语录` - 回复回收站中的原语录恢复，"
+        "仅原删除者或满足删除权限的管理员可用\n\n"
+        "`tag` - 回复语录图片后查看统一 tag 与上传者（多图按 1.、2.、3. 编号）\n"
         "`tag all` / `alltag` - `tag` 的兼容写法，查看相同的全部 tag\n"
         "`tag add` / `tag del` - 为回复中的全部语录图片添加或删除 tag\n"
         "`addtag` / `deltag` / `tagadd` / `tagdel` - `tag add/del` 的等价别名\n\n"
@@ -114,7 +119,7 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="v1.4.1",
+        version="v1.4.2",
         admin_level=0,
         configs=[
             RegisterConfig(
@@ -242,3 +247,15 @@ __plugin_meta__ = PluginMetadata(
         ],
     ).dict(),
 )
+
+
+@scheduler_manager.runtime_job(Trigger.interval(hours=1))
+async def _purge_quote_recycle_bin(bot: Bot, context: ScheduleContext) -> None:
+    _ = bot, context
+    result = await QuoteService.purge_expired_quotes()
+    if result.purged or result.failed:
+        logger.info(
+            f"语录回收站定时清理完成：彻底删除 {result.purged} 条，"
+            f"失败 {result.failed} 条。",
+            "群聊语录",
+        )

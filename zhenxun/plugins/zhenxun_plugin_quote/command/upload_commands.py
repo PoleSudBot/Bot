@@ -852,11 +852,18 @@ async def _process_upload_image(
             await file.write(img_data)
 
         image_hash = await get_img_hash(temp_image_path)
-        if (
-            image_hash
-            and await Quote.filter(group_id=group_id, image_hash=image_hash).exists()
-        ):
-            return _UploadImageResult(status="duplicate")
+        if image_hash:
+            duplicate_quote = await Quote.filter(
+                group_id=group_id, image_hash=image_hash
+            ).first()
+            if duplicate_quote:
+                return _UploadImageResult(
+                    status=(
+                        "recycled"
+                        if getattr(duplicate_quote, "deleted_at", None)
+                        else "duplicate"
+                    )
+                )
 
         ocr_content = await (
             TextRecognitionService.recognize_batch(str(temp_image_path))
@@ -882,7 +889,11 @@ async def _process_upload_image(
                 missing_auto_tags=not await QuoteService.get_quote_tags(quote),
             )
         if quote and not is_new:
-            return _UploadImageResult(status="duplicate")
+            return _UploadImageResult(
+                status=(
+                    "recycled" if getattr(quote, "deleted_at", None) else "duplicate"
+                )
+            )
         return _UploadImageResult(status="failed", error="保存失败，可能是数据库错误")
     except ImageProcessError as e:
         return _UploadImageResult(status="failed", error=str(e))
@@ -896,6 +907,7 @@ async def _process_upload_image(
 def _build_batch_upload_summary(results: list[_UploadImageResult]) -> str:
     success_count = sum(result.status == "success" for result in results)
     duplicate_count = sum(result.status == "duplicate" for result in results)
+    recycled_count = sum(result.status == "recycled" for result in results)
     missing_auto_tags_count = sum(
         result.status == "success" and result.missing_auto_tags for result in results
     )
@@ -907,9 +919,13 @@ def _build_batch_upload_summary(results: list[_UploadImageResult]) -> str:
     lines = [
         (
             f"批量上传完成：成功 {success_count}/{len(results)} 张，"
-            f"重复 {duplicate_count} 张，失败 {len(failed_results)} 张。"
+            f"重复 {duplicate_count} 张"
+            f"{f'，回收站重复 {recycled_count} 张' if recycled_count else ''}，"
+            f"失败 {len(failed_results)} 张。"
         )
     ]
+    if recycled_count:
+        lines.append("回收站中的语录请回复原语录使用「恢复语录」恢复。")
     if failed_results:
         details = "；".join(
             f"第 {index} 张：{result.error or '未知错误'}"
@@ -995,6 +1011,10 @@ async def save_img_handle(bot: Bot, event: MessageEvent, arp: Arparma, state: T_
                     "message": MessageSegment.reply(event.message_id) + "不要重复记录",
                 },
             )
+        elif result.status == "recycled":
+            await MessageUtils.build_message(
+                "该语录位于回收站，请回复原语录使用「恢复语录」恢复。"
+            ).send(target=event, bot=bot)
         else:
             await MessageUtils.build_message(result.error or "保存失败").send(
                 target=event,
@@ -1265,8 +1285,16 @@ async def _handle_record_command(
     image_hash = hashlib.md5(img_data).hexdigest()
     group_id = session.group.id if session.group else ""
 
-    if await Quote.filter(group_id=group_id, image_hash=image_hash).exists():
-        await MessageUtils.build_message("不要重复记录").send(target=event, bot=bot)
+    duplicate_quote = await Quote.filter(
+        group_id=group_id, image_hash=image_hash
+    ).first()
+    if duplicate_quote:
+        message = (
+            "该语录位于回收站，请回复原语录使用「恢复语录」恢复。"
+            if getattr(duplicate_quote, "deleted_at", None)
+            else "不要重复记录"
+        )
+        await MessageUtils.build_message(message).send(target=event, bot=bot)
         return
 
     image_name = image_hash + ".png"
@@ -1290,7 +1318,10 @@ async def _handle_record_command(
                 _build_record_success_message(img_data)
             ).send(target=event, bot=bot)
         else:
-            msg = "不要重复记录" if not is_new else "保存语录时发生意外，请稍后再试"
+            if quote and getattr(quote, "deleted_at", None):
+                msg = "该语录位于回收站，请回复原语录使用「恢复语录」恢复。"
+            else:
+                msg = "不要重复记录" if not is_new else "保存语录时发生意外，请稍后再试"
             await MessageUtils.build_message(msg).send(target=event, bot=bot)
     except Exception as e:
         logger.error(f"记录语录过程中发生IO或数据库错误: {e}", "群聊语录", e=e)

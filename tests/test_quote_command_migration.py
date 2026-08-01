@@ -219,8 +219,10 @@ def test_plugin_usage_text_is_updated_to_new_commands():
     assert 'key="BATCH_TEXT_RECOGNITION_PRIORITY"' in usage_text
     assert 'value="paddleocr_api"' in usage_text
     assert 'key="BATCH_UPLOAD_OCR_MODE"' not in usage_text
-    assert 'version="v1.4.1"' in usage_text
+    assert 'version="v1.4.2"' in usage_text
     assert 'key="TAG_ALIAS_ADMIN_LEVEL"' in usage_text
     assert "`taglink tag1 tag2 ...`" in usage_text
     assert "`tag别名`" in usage_text
     assert "`语录 #tag`" in usage_text
+    assert "`恢复语录`" in usage_text
+    assert "查看统一 tag 与上传者" in usage_text

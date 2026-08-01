@@ -10,12 +10,14 @@ import time
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any, ClassVar
 
 from cachetools import TTLCache
 from nonebot.adapters.onebot.v11 import Bot
 from nonebot_plugin_alconna import At, Text
+from tortoise import timezone
 from tortoise.expressions import F, Q
 from tortoise.functions import Count
 from tortoise.transactions import in_transaction
@@ -96,6 +98,14 @@ class QuoteAuditSummary:
     issues: list[QuoteAuditIssue]
 
 
+@dataclass(frozen=True)
+class QuotePurgeSummary:
+    """到期回收站清理结果。"""
+
+    purged: int
+    failed: int
+
+
 @dataclass
 class _LockEntry:
     lock: asyncio.Lock
@@ -138,7 +148,20 @@ class QuoteService:
     _tag_schema_version: ClassVar[int] = 1
     _tag_migration_batch_size: ClassVar[int] = 200
     _slow_query_seconds: ClassVar[float] = 0.5
+    _recycle_retention: ClassVar[timedelta] = timedelta(days=7)
+    _purge_batch_size: ClassVar[int] = 100
     _operation_locks: ClassVar[_KeyedAsyncLockPool] = _KeyedAsyncLockPool()
+    _purge_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+
+    @staticmethod
+    def active_quotes(*args, **filters):
+        """返回未进入回收站的语录查询。"""
+        return Quote.filter(*args, deleted_at__isnull=True, **filters)
+
+    @staticmethod
+    def recycled_quotes(*args, **filters):
+        """返回回收站中的语录查询。"""
+        return Quote.filter(*args, deleted_at__not_isnull=True, **filters)
 
     @classmethod
     @asynccontextmanager
@@ -654,7 +677,7 @@ class QuoteService:
     @classmethod
     async def get_quote_ids_for_user(cls, group_id: str, user_id: str) -> list[int]:
         quoted_ids = set(
-            await Quote.filter(
+            await cls.active_quotes(
                 group_id=str(group_id), quoted_user_id=str(user_id)
             ).values_list("id", flat=True)
         )
@@ -666,7 +689,7 @@ class QuoteService:
         )
         legacy_tagged_ids = {
             quote.id
-            for quote in await Quote.filter(
+            for quote in await cls.active_quotes(
                 group_id=str(group_id), tag_schema_version=0
             )
             if str(getattr(quote, "quoted_user_id", "") or "") == str(user_id)
@@ -780,15 +803,22 @@ class QuoteService:
             return None, False
 
     @staticmethod
-    async def delete_quote(group_id: str, image_basename: str) -> bool:
-        """从数据库删除语录并删除对应的图片文件"""
+    async def delete_quote(
+        group_id: str,
+        image_basename: str,
+        deleted_by_user_id: str | None = None,
+    ) -> bool:
+        """将指定语录移入回收站。"""
         try:
             logger.info(
                 f"尝试删除语录 - 群组: {group_id}, 图片: {image_basename}", "群聊语录"
             )
             quote = await QuoteService.find_quote_by_basename(group_id, image_basename)
             if quote:
-                return await QuoteService.delete_quote_instance(quote)
+                return await QuoteService.delete_quote_instance(
+                    quote,
+                    deleted_by_user_id=deleted_by_user_id,
+                )
             else:
                 logger.warning(
                     f"要删除的语录不存在 - 群组: {group_id}, 图片: {image_basename}",
@@ -800,32 +830,156 @@ class QuoteService:
             return False
 
     @staticmethod
-    async def delete_quote_instance(quote: Quote) -> bool:
-        """隔离图片后删除语录，数据库失败时恢复原文件。"""
-        async with QuoteService._operation_locks.hold(f"delete:{quote.id}"):
+    async def delete_quote_instance(
+        quote: Quote,
+        deleted_by_user_id: str | None = None,
+    ) -> bool:
+        """将语录原位标记为已删除，保留图片与全部追责数据。"""
+        async with QuoteService._operation_locks.hold(f"quote:{quote.id}"):
+            deleted_at = timezone.now()
+            try:
+                updated_count = await QuoteService.active_quotes(id=quote.id).update(
+                    deleted_at=deleted_at,
+                    deleted_by_user_id=(
+                        str(deleted_by_user_id) if deleted_by_user_id else None
+                    ),
+                )
+                if not updated_count:
+                    logger.warning(
+                        f"语录不存在或已在回收站 - ID: {quote.id}", "群聊语录"
+                    )
+                    return False
+
+                quote.deleted_at = deleted_at
+                quote.deleted_by_user_id = (
+                    str(deleted_by_user_id) if deleted_by_user_id else None
+                )
+                logger.info(
+                    f"语录已移入回收站 - ID: {quote.id}, 群组: {quote.group_id}, "
+                    f"删除者: {quote.deleted_by_user_id or '未知'}",
+                    "群聊语录",
+                )
+                return True
+            except Exception as e:
+                logger.error(
+                    f"语录移入回收站失败 - ID: {quote.id}, "
+                    f"群组: {quote.group_id}, 错误: {e}",
+                    "群聊语录",
+                    e=e,
+                )
+                return False
+
+    @staticmethod
+    async def restore_quote_instance(quote: Quote) -> bool:
+        """恢复回收站语录；缺图或越界记录保持原状。"""
+        async with QuoteService._operation_locks.hold(f"quote:{quote.id}"):
             try:
                 absolute_image_path = resolve_quote_image_path(quote.image_path)
             except ValueError as path_error:
                 logger.warning(
-                    f"拒绝删除越界语录图片 - ID: {quote.id}, 路径: {quote.image_path}",
+                    f"拒绝恢复越界语录图片 - ID: {quote.id}, 路径: {quote.image_path}",
                     "群聊语录",
                     e=path_error,
                 )
                 return False
 
-            # 删除与同路径保存共用一把锁，避免文件隔离期间被重新创建或清理。
             async with QuoteService.image_write_lock(absolute_image_path):
-                return await QuoteService._delete_quote_instance_unlocked(
+                if not absolute_image_path.is_file():
+                    logger.warning(
+                        f"拒绝恢复缺图语录 - ID: {quote.id}, "
+                        f"路径: {absolute_image_path}",
+                        "群聊语录",
+                    )
+                    return False
+
+                try:
+                    updated_count = await QuoteService.recycled_quotes(
+                        id=quote.id
+                    ).update(deleted_at=None, deleted_by_user_id=None)
+                    if not updated_count:
+                        logger.warning(
+                            f"语录不存在或已恢复 - ID: {quote.id}", "群聊语录"
+                        )
+                        return False
+
+                    quote.deleted_at = None
+                    quote.deleted_by_user_id = None
+                    logger.info(
+                        f"语录恢复成功 - ID: {quote.id}, 群组: {quote.group_id}",
+                        "群聊语录",
+                    )
+                    return True
+                except Exception as e:
+                    logger.error(
+                        f"语录恢复失败 - ID: {quote.id}, "
+                        f"群组: {quote.group_id}, 错误: {e}",
+                        "群聊语录",
+                        e=e,
+                    )
+                    return False
+
+    @classmethod
+    async def purge_expired_quotes(
+        cls,
+        *,
+        now: datetime | None = None,
+    ) -> QuotePurgeSummary:
+        """分批彻底清理已超过七天的回收站语录。"""
+        cutoff = (now or timezone.now()) - cls._recycle_retention
+        purged = 0
+        failed = 0
+        last_id = 0
+
+        async with cls._purge_lock:
+            while True:
+                quote_ids = list(
+                    await cls.recycled_quotes(
+                        deleted_at__lte=cutoff,
+                        id__gt=last_id,
+                    )
+                    .order_by("id")
+                    .limit(cls._purge_batch_size)
+                    .values_list("id", flat=True)
+                )
+                if not quote_ids:
+                    break
+
+                last_id = quote_ids[-1]
+                for quote_id in quote_ids:
+                    quote = await cls.recycled_quotes(id=quote_id).first()
+                    if quote and await cls.purge_quote_instance(quote):
+                        purged += 1
+                    else:
+                        failed += 1
+
+        return QuotePurgeSummary(purged=purged, failed=failed)
+
+    @staticmethod
+    async def purge_quote_instance(quote: Quote) -> bool:
+        """隔离图片后物理删除到期记录，数据库失败时恢复原文件。"""
+        async with QuoteService._operation_locks.hold(f"quote:{quote.id}"):
+            try:
+                absolute_image_path = resolve_quote_image_path(quote.image_path)
+            except ValueError as path_error:
+                logger.warning(
+                    f"拒绝清理越界语录图片 - ID: {quote.id}, 路径: {quote.image_path}",
+                    "群聊语录",
+                    e=path_error,
+                )
+                return False
+
+            async with QuoteService.image_write_lock(absolute_image_path):
+                return await QuoteService._purge_quote_instance_unlocked(
                     quote,
                     absolute_image_path,
                 )
 
     @staticmethod
-    async def _delete_quote_instance_unlocked(
+    async def _purge_quote_instance_unlocked(
         quote: Quote,
         absolute_image_path: Path,
     ) -> bool:
-        """在同一语录删除锁内执行文件隔离和数据库删除补偿。"""
+        """在同一语录锁内执行文件隔离和数据库删除补偿。"""
         isolated_image_path: Path | None = None
         try:
             if absolute_image_path.exists():
@@ -837,7 +991,7 @@ class QuoteService:
             else:
                 logger.warning(f"图片文件不存在: {absolute_image_path}", "群聊语录")
 
-            deleted_count = await Quote.filter(id=quote.id).delete()
+            deleted_count = await QuoteService.recycled_quotes(id=quote.id).delete()
             if not deleted_count:
                 raise RuntimeError("语录记录不存在或已被删除")
 
@@ -852,7 +1006,7 @@ class QuoteService:
                         e=cleanup_error,
                     )
             logger.info(
-                f"语录删除成功 - ID: {quote.id}, 群组: {quote.group_id}",
+                f"回收站语录彻底删除成功 - ID: {quote.id}, 群组: {quote.group_id}",
                 "群聊语录",
             )
             return True
@@ -872,7 +1026,7 @@ class QuoteService:
                         e=restore_error,
                     )
             logger.error(
-                f"按语录实体删除失败 - ID: {quote.id}, "
+                f"回收站语录彻底删除失败 - ID: {quote.id}, "
                 f"群组: {quote.group_id}, 错误: {e}",
                 "群聊语录",
                 e=e,
@@ -895,7 +1049,7 @@ class QuoteService:
                 )
                 quotes = await cls.get_quotes_by_ids_in_order(candidate_ids)
             else:
-                quotes = list(await Quote.filter(group_id=group_id))
+                quotes = list(await cls.active_quotes(group_id=group_id))
 
             count = len(quotes)
             if count == 0:
@@ -971,7 +1125,9 @@ class QuoteService:
 
         legacy_quotes = [
             quote
-            for quote in await Quote.filter(group_id=group_id, tag_schema_version=0)
+            for quote in await cls.active_quotes(
+                group_id=group_id, tag_schema_version=0
+            )
             if not cls._uses_relation_tags(quote)
         ]
         if legacy_quotes and not hasattr(legacy_quotes[0], "tag_schema_version"):
@@ -1019,10 +1175,10 @@ class QuoteService:
         text_candidate_ids: set[int] = set()
         if not tag_only:
             text_candidate_ids = set(
-                await Quote.filter(group_id=group_id)
-                .filter(
+                await cls.active_quotes(
                     Q(ocr_text__icontains=keyword)
-                    | Q(recorded_text__icontains=keyword)
+                    | Q(recorded_text__icontains=keyword),
+                    group_id=group_id,
                 )
                 .values_list("id", flat=True)
             )
@@ -1075,10 +1231,10 @@ class QuoteService:
                 ).values_list("quote_id", flat=True)
             )
             token_text_ids = set(
-                await Quote.filter(group_id=group_id)
-                .filter(
+                await cls.active_quotes(
                     Q(ocr_text__icontains=token)
-                    | Q(recorded_text__icontains=token)
+                    | Q(recorded_text__icontains=token),
+                    group_id=group_id,
                 )
                 .values_list("id", flat=True)
             )
@@ -1239,7 +1395,8 @@ class QuoteService:
         """仅拉取语录 ID，避免随机多张时把整群 ORM 实体化到内存。"""
         try:
             return list(
-                await Quote.filter(group_id=group_id).values_list("id", flat=True)
+                await QuoteService.active_quotes(group_id=group_id)
+                .values_list("id", flat=True)
             )
         except Exception as e:
             logger.error(
@@ -1256,7 +1413,7 @@ class QuoteService:
             return []
 
         try:
-            quotes = await Quote.filter(id__in=ids)
+            quotes = await QuoteService.active_quotes(id__in=ids)
             quote_by_id = {quote.id: quote for quote in quotes}
             # SQL 的 IN 查询不保证结果顺序，这里按输入顺序重排，
             # 否则多张发送时会把前面挑好的去重/随机顺序打乱。
@@ -1269,9 +1426,13 @@ class QuoteService:
             )
             return []
 
-    @staticmethod
+    @classmethod
     async def find_quote_by_basename(
-        group_id: str, image_basename: str
+        cls,
+        group_id: str,
+        image_basename: str,
+        *,
+        recycled_only: bool = False,
     ) -> Quote | None:
         """根据图片文件名查找语录"""
         try:
@@ -1280,7 +1441,8 @@ class QuoteService:
                 "群聊语录",
             )
 
-            quotes = await Quote.filter(
+            quote_query = cls.recycled_quotes if recycled_only else cls.active_quotes
+            quotes = await quote_query(
                 group_id=group_id, image_path__iendswith=image_basename
             )
             quote = quotes[0] if quotes else None
@@ -1331,16 +1493,19 @@ class QuoteService:
         group_id: str,
         reply_image_md5: str | None = None,
         reply_image_basename: str | None = None,
+        *,
+        recycled_only: bool = False,
     ) -> Quote | None:
         """根据回复中的图片标识查找语录，优先走 md5 链路，失败后回退 basename。"""
         try:
+            quote_query = cls.recycled_quotes if recycled_only else cls.active_quotes
             if reply_image_md5:
                 logger.info(
                     f"根据回复图片 md5 查找语录 - 群组: {group_id}, md5: {reply_image_md5}",
                     "群聊语录",
                 )
 
-                exact_candidates = await Quote.filter(
+                exact_candidates = await quote_query(
                     group_id=group_id,
                     image_path__iendswith=f"{reply_image_md5}.png",
                 ).limit(10)
@@ -1356,7 +1521,7 @@ class QuoteService:
                 else:
                     logger.debug("回复图片 md5 首选粗筛未命中", "群聊语录")
 
-                fuzzy_candidates = await Quote.filter(
+                fuzzy_candidates = await quote_query(
                     group_id=group_id,
                     image_path__icontains=reply_image_md5,
                 ).limit(10)
@@ -1377,6 +1542,12 @@ class QuoteService:
                     f"回复图片查找回退到 basename 链路 - 群组: {group_id}, basename: {reply_image_basename}",
                     "群聊语录",
                 )
+                if recycled_only:
+                    return await cls.find_quote_by_basename(
+                        group_id,
+                        reply_image_basename,
+                        recycled_only=True,
+                    )
                 return await cls.find_quote_by_basename(group_id, reply_image_basename)
 
             logger.info(
@@ -1396,7 +1567,11 @@ class QuoteService:
     async def get_last_quote(group_id: str) -> Quote | None:
         """获取群组内最后保存的一条语录"""
         try:
-            return await Quote.filter(group_id=group_id).order_by("-id").first()
+            return (
+                await QuoteService.active_quotes(group_id=group_id)
+                .order_by("-id")
+                .first()
+            )
         except Exception:
             return None
 
@@ -1429,7 +1604,7 @@ class QuoteService:
                 quotes = await cls.get_quotes_by_ids_in_order(candidate_ids)
             else:
                 return (
-                    await Quote.filter(group_id=group_id)
+                    await cls.active_quotes(group_id=group_id)
                     .order_by("-id")
                     .offset(index - 1)
                     .first()
@@ -1454,7 +1629,7 @@ class QuoteService:
         """获取所有语录"""
         try:
             logger.info("开始获取所有语录", "群聊语录")
-            quotes = await Quote.all()
+            quotes = await QuoteService.active_quotes()
             logger.info(f"获取所有语录成功 - 总数: {len(quotes)}", "群聊语录")
             return quotes
         except Exception as e:
@@ -1482,7 +1657,7 @@ class QuoteService:
             async with in_transaction() as connection:
                 # 锁内重新读取，避免并发请求都基于同一个旧列表整体覆盖。
                 locked_quote = (
-                    await Quote.filter(id=quote.id)
+                    await cls.active_quotes(id=quote.id)
                     .select_for_update()
                     .using_db(connection)
                     .get()
@@ -1573,7 +1748,7 @@ class QuoteService:
             async with in_transaction() as connection:
                 # 删除也必须基于锁内最新值，否则会把同时新增的 tag 一并覆盖掉。
                 locked_quote = (
-                    await Quote.filter(id=quote.id)
+                    await cls.active_quotes(id=quote.id)
                     .select_for_update()
                     .using_db(connection)
                     .get()
@@ -1759,7 +1934,9 @@ class QuoteService:
 
         try:
             unique_ids = list(dict.fromkeys(quote_ids))
-            await Quote.filter(id__in=unique_ids).update(view_count=F("view_count") + 1)
+            await cls.active_quotes(id__in=unique_ids).update(
+                view_count=F("view_count") + 1
+            )
             logger.debug(
                 f"批量增加语录查看次数成功 - IDs: {unique_ids}",
                 "群聊语录",
@@ -1789,7 +1966,7 @@ class QuoteService:
                     if value is not None:
                         query &= Q(**{key: value})
 
-            candidates = await Quote.filter(query)
+            candidates = await cls.active_quotes(query)
             final_matched_quotes = (
                 [
                     quote
@@ -1820,10 +1997,10 @@ class QuoteService:
         """查找指定群组中由已退群用户产生或记录的语录"""
         logger.info(f"开始查找群组 {group_id} 中已退群用户的语录", "群聊语录")
         try:
-            uploaders = await Quote.filter(
+            uploaders = await QuoteService.active_quotes(
                 group_id=group_id, uploader_user_id__not_isnull=True
             ).values_list("uploader_user_id", flat=True)
-            quoted = await Quote.filter(
+            quoted = await QuoteService.active_quotes(
                 group_id=group_id, quoted_user_id__not_isnull=True
             ).values_list("quoted_user_id", flat=True)
             all_quote_users = set(uploaders) | set(quoted)
@@ -1845,7 +2022,7 @@ class QuoteService:
                 f"在群组 {group_id} 中找到 {len(left_user_ids)} 个已退群用户留下的语录记录。"
             )
 
-            left_user_quotes = await Quote.filter(
+            left_user_quotes = await QuoteService.active_quotes(
                 Q(group_id=group_id)
                 & (
                     Q(uploader_user_id__in=list(left_user_ids))
@@ -1907,7 +2084,7 @@ class QuoteService:
         logger.debug(f"开始获取群组 {group_id} 最热门语录，数量: {limit}", "群聊语录")
         try:
             hottest_quotes = (
-                await Quote.filter(group_id=group_id)
+                await QuoteService.active_quotes(group_id=group_id)
                 .order_by("-view_count")
                 .limit(limit)
                 .all()
@@ -2051,7 +2228,9 @@ class QuoteService:
         """获取最高产的语录上传用户"""
         logger.debug(f"获取群组 {group_id} 最高产上传用户，数量: {limit}", "群聊语录")
         prolific_users = (
-            await Quote.filter(group_id=group_id, uploader_user_id__not_isnull=True)
+            await QuoteService.active_quotes(
+                group_id=group_id, uploader_user_id__not_isnull=True
+            )
             .annotate(upload_count=Count("uploader_user_id"))
             .group_by("uploader_user_id")
             .order_by("-upload_count")
@@ -2065,7 +2244,9 @@ class QuoteService:
         """获取被记录语录最多的用户"""
         logger.debug(f"获取群组 {group_id} 被记录最多用户，数量: {limit}", "群聊语录")
         quoted_users = (
-            await Quote.filter(group_id=group_id, quoted_user_id__not_isnull=True)
+            await QuoteService.active_quotes(
+                group_id=group_id, quoted_user_id__not_isnull=True
+            )
             .annotate(quote_count=Count("quoted_user_id"))
             .group_by("quoted_user_id")
             .order_by("-quote_count")

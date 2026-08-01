@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from importlib import util as importlib_util
 import json
 import os
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import httpx
 import nonebot
 import pytest
+from tortoise import Tortoise
 
 nonebot.init()
 nonebot.load_plugin("nonebot_plugin_apscheduler")
@@ -77,6 +79,9 @@ text_recognition_module = sys.modules[
 paddleocr_api_module = sys.modules[f"{PLUGIN_PACKAGE}.services.paddleocr_api"]
 
 QuoteService = quote_service_module.QuoteService
+Quote = quote_service_module.Quote
+QuoteTag = quote_service_module.QuoteTag
+QuoteTagLink = quote_service_module.QuoteTagLink
 Image = manage_commands.Image
 At = upload_commands.At
 Text = upload_commands.Text
@@ -153,6 +158,9 @@ class _FakeExistsQuery:
 
     async def exists(self):
         return self._exists_result
+
+    async def first(self):
+        return SimpleNamespace(deleted_at=None) if self._exists_result else None
 
 
 def _build_filter(
@@ -449,7 +457,8 @@ def test_extract_quote_query_and_count_cases(
     expected: tuple[str, int],
 ):
     assert (
-        query_commands._extract_quote_query_and_count(keywords, option_count) == expected
+        query_commands._extract_quote_query_and_count(keywords, option_count)
+        == expected
     )
 
 
@@ -764,7 +773,9 @@ async def test_match_upload_with_image_requires_current_or_reply_upload_segment(
 
 @pytest.mark.asyncio
 async def test_match_record_reply_requires_reply():
-    assert await upload_commands._match_record_reply(SimpleNamespace(reply=None)) is False
+    assert (
+        await upload_commands._match_record_reply(SimpleNamespace(reply=None)) is False
+    )
     assert (
         await upload_commands._match_record_reply(
             SimpleNamespace(reply=SimpleNamespace(message=[]))
@@ -792,7 +803,7 @@ async def test_extract_manual_tags_with_mention_names_uses_card_and_normalizes()
 
 
 @pytest.mark.asyncio
-async def test_extract_manual_tags_with_mention_names_falls_back_to_display_or_user_only():
+async def test_extract_manual_tags_falls_back_to_display_or_user_only():
     class _FailBot:
         async def get_group_member_info(self, **kwargs):
             raise RuntimeError("boom")
@@ -851,12 +862,16 @@ async def test_get_quote_by_history_index_sorts_search_matches(monkeypatch):
         SimpleNamespace(id=9, group_id="123"),
         SimpleNamespace(id=5, group_id="123"),
     ]
-    calls: list[tuple[str, str, str | None]] = []
+    calls: list[tuple[str, str, str | None, bool]] = []
 
     async def _fake_search_quotes(
-        group_id: str, keyword: str, user_id_filter: str | None = None
+        group_id: str,
+        keyword: str,
+        user_id_filter: str | None = None,
+        *,
+        tag_only: bool = False,
     ):
-        calls.append((group_id, keyword, user_id_filter))
+        calls.append((group_id, keyword, user_id_filter, tag_only))
         return list(quotes)
 
     monkeypatch.setattr(
@@ -864,12 +879,12 @@ async def test_get_quote_by_history_index_sorts_search_matches(monkeypatch):
     )
 
     result = await QuoteService.get_quote_by_history_index(
-        "123", 2, "南极", "114514"
+        "123", 2, "南极", "114514", tag_only=True
     )
 
     assert result is not None
     assert result.id == 5
-    assert calls == [("123", "南极", "114514")]
+    assert calls == [("123", "南极", "114514", True)]
 
 
 def test_select_quote_ids_without_record_prefers_unseen(monkeypatch):
@@ -891,7 +906,10 @@ def test_record_recent_quote_ids_trims_history_window(monkeypatch):
         "group_all", list(range(1, QuoteService._max_history_per_key + 5))
     )
 
-    assert len(QuoteService._recent_quotes["group_all"]) == QuoteService._max_history_per_key
+    assert (
+        len(QuoteService._recent_quotes["group_all"])
+        == QuoteService._max_history_per_key
+    )
     assert QuoteService._recent_quotes["group_all"][0] == 5
 
 
@@ -904,7 +922,9 @@ async def test_increment_view_counts_uses_single_bulk_update(monkeypatch):
     update_calls: list[dict] = []
 
     monkeypatch.setattr(
-        quote_service_module.Quote, "filter", _build_filter(quotes, update_calls=update_calls)
+        quote_service_module.Quote,
+        "filter",
+        _build_filter(quotes, update_calls=update_calls),
     )
 
     await QuoteService.increment_view_counts([1, 2, 2])
@@ -930,11 +950,13 @@ async def test_match_reply_quote_delete_matches_exact_delete_and_caches_quote(
         def get_plaintext(self):
             return self._text
 
-    async def _fake_get_quote_from_reply(bot, event, session):
-        return quote
+    async def _fake_get_quotes_from_reply(bot, event, session):
+        return manage_commands.ReplyQuoteResolution([quote], image_count=1)
 
     monkeypatch.setattr(manage_commands, "MessageEvent", _FakeMessageEvent)
-    monkeypatch.setattr(manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply)
+    monkeypatch.setattr(
+        manage_commands, "_get_quotes_from_reply", _fake_get_quotes_from_reply
+    )
 
     state = {}
     matched = await manage_commands._match_reply_quote_delete(
@@ -945,7 +967,7 @@ async def test_match_reply_quote_delete_matches_exact_delete_and_caches_quote(
     )
 
     assert matched is True
-    assert state["reply_quote"] is quote
+    assert state["reply_quote"].quotes == [quote]
 
 
 @pytest.mark.asyncio
@@ -969,7 +991,9 @@ async def test_match_reply_quote_delete_rejects_non_exact_delete_without_lookup(
         return SimpleNamespace(id=1)
 
     monkeypatch.setattr(manage_commands, "MessageEvent", _FakeMessageEvent)
-    monkeypatch.setattr(manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply)
+    monkeypatch.setattr(
+        manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply
+    )
 
     state = {}
     matched = await manage_commands._match_reply_quote_delete(
@@ -992,11 +1016,13 @@ async def test_match_reply_quote_delete_rejects_when_reply_is_not_quote(
         def get_plaintext(self):
             return "删除"
 
-    async def _fake_get_quote_from_reply(bot, event, session):
-        return None
+    async def _fake_get_quotes_from_reply(bot, event, session):
+        return manage_commands.ReplyQuoteResolution([])
 
     monkeypatch.setattr(manage_commands, "MessageEvent", _FakeMessageEvent)
-    monkeypatch.setattr(manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply)
+    monkeypatch.setattr(
+        manage_commands, "_get_quotes_from_reply", _fake_get_quotes_from_reply
+    )
 
     state = {}
     matched = await manage_commands._match_reply_quote_delete(
@@ -1012,7 +1038,9 @@ async def test_match_reply_quote_delete_rejects_when_reply_is_not_quote(
 
 @pytest.mark.asyncio
 async def test_set_pending_emoji_like_calls_napcat_api(monkeypatch):
-    monkeypatch.setattr(upload_commands.Config, "get_config", lambda *args, **kwargs: "10024")
+    monkeypatch.setattr(
+        upload_commands.Config, "get_config", lambda *args, **kwargs: "10024"
+    )
 
     called: list[tuple[str, dict]] = []
 
@@ -1031,7 +1059,9 @@ async def test_set_pending_emoji_like_calls_napcat_api(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_set_pending_emoji_like_skips_when_disabled(monkeypatch):
-    monkeypatch.setattr(upload_commands.Config, "get_config", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        upload_commands.Config, "get_config", lambda *args, **kwargs: ""
+    )
 
     called = False
 
@@ -1047,7 +1077,9 @@ async def test_set_pending_emoji_like_skips_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_set_pending_emoji_like_ignores_api_failure(monkeypatch):
-    monkeypatch.setattr(upload_commands.Config, "get_config", lambda *args, **kwargs: "10024")
+    monkeypatch.setattr(
+        upload_commands.Config, "get_config", lambda *args, **kwargs: "10024"
+    )
 
     class _Bot:
         async def call_api(self, name: str, **kwargs):
@@ -1141,13 +1173,47 @@ async def test_save_img_handle_writes_dual_mention_tags(monkeypatch, tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_get_images_from_reply_without_event_context_preserves_image_order(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    image_files = ["a" * 32 + ".png", "b" * 32 + ".jpg"]
+
+    class _Bot:
+        adapter = SimpleNamespace(get_name=lambda: "OneBot V11")
+
+        async def get_msg(self, message_id: int):
+            assert message_id == 1001
+            return {
+                "message": [
+                    {"type": "text", "data": {"text": "ignored"}},
+                    {"type": "image", "data": {"file": image_files[0]}},
+                    {"type": "image", "data": {"file": image_files[1]}},
+                ]
+            }
+
+    async def _fake_reply_fetch(event, bot):
+        return SimpleNamespace(id="1001")
+
+    monkeypatch.setattr(manage_commands, "V11Bot", _Bot)
+    monkeypatch.setattr(manage_commands, "reply_fetch", _fake_reply_fetch)
+
+    images, unresolved_count = await manage_commands._get_images_from_reply(
+        SimpleNamespace(), _Bot()
+    )
+
+    assert [image.id for image in images] == image_files
+    assert unresolved_count == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "response_shape",
     ["messages", "data_message", "lagrange_message"],
 )
+@pytest.mark.parametrize("source_shape", ["forward", "json_string", "json_dict"])
 async def test_extract_forward_images_supports_onebot_response_shapes(
-    monkeypatch: pytest.MonkeyPatch,
     response_shape: str,
+    source_shape: str,
 ):
     node_messages = [
         [{"type": "image", "data": {"file": "first.png"}}],
@@ -1168,32 +1234,135 @@ async def test_extract_forward_images_supports_onebot_response_shapes(
             ]
         }
 
-    async def _fake_extract_direct_images(bot, message):
-        return [
-            upload_commands.UniImage(id=segment["data"]["file"])
-            for segment in message
-            if segment["type"] == "image"
+    if source_shape == "forward":
+        source_message = [{"type": "forward", "data": {"id": "forward-id"}}]
+    else:
+        payload = {
+            "app": "com.tencent.multimsg",
+            "meta": {"detail": {"resid": "forward-id"}},
+            "view": "contact",
+        }
+        source_message = [
+            {
+                "type": "json",
+                "data": {
+                    "data": (
+                        json.dumps(payload)
+                        if source_shape == "json_string"
+                        else payload
+                    )
+                },
+            }
         ]
 
     class _Bot:
+        adapter = SimpleNamespace(get_name=lambda: "OneBot V11")
+
         async def call_api(self, name: str, **kwargs):
             assert name == "get_forward_msg"
             assert kwargs == {"id": "forward-id"}
             return response
 
-    monkeypatch.setattr(
-        upload_commands,
-        "_extract_direct_images",
-        _fake_extract_direct_images,
-    )
-
     images, has_forward = await upload_commands._extract_forward_images(
         _Bot(),
-        [{"type": "forward", "data": {"id": "forward-id"}}],
+        source_message,
     )
 
     assert has_forward is True
     assert [image.id for image in images] == ["first.png", "second.png"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw_payload",
+    [
+        "{invalid-json",
+        json.dumps({"app": "com.tencent.mobileqq", "meta": {}}),
+        json.dumps({"app": "com.tencent.multimsg", "meta": {"detail": {}}}),
+    ],
+)
+async def test_extract_forward_images_ignores_unrelated_json(raw_payload: str):
+    class _Bot:
+        async def call_api(self, name: str, **kwargs):
+            raise AssertionError("unrelated JSON must not call get_forward_msg")
+
+    images, has_forward = await upload_commands._extract_forward_images(
+        _Bot(),
+        [{"type": "json", "data": {"data": raw_payload}}],
+    )
+
+    assert images == []
+    assert has_forward is False
+
+
+@pytest.mark.asyncio
+async def test_get_quotes_from_reply_resolves_multimsg_json_forward(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    image_files = ["a" * 32 + ".png", "b" * 32 + ".png"]
+    quotes = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+    payload = {
+        "app": "com.tencent.multimsg",
+        "meta": {"detail": {"resid": "forward-id"}},
+        "view": "contact",
+    }
+
+    class _Bot:
+        adapter = SimpleNamespace(get_name=lambda: "OneBot V11")
+
+        async def get_msg(self, message_id: int):
+            assert message_id == 1001
+            return {
+                "message": [
+                    {
+                        "type": "json",
+                        "data": {"data": json.dumps(payload)},
+                    }
+                ]
+            }
+
+        async def call_api(self, name: str, **kwargs):
+            assert name == "get_forward_msg"
+            assert kwargs == {"id": "forward-id"}
+            return {
+                "messages": [
+                    {"message": [{"type": "image", "data": {"file": file}}]}
+                    for file in image_files
+                ]
+            }
+
+    async def _fake_reply_fetch(event, bot):
+        return SimpleNamespace(id="1001")
+
+    async def _fake_is_reply_to_bot(event):
+        return True
+
+    async def _fake_find(
+        group_id,
+        reply_image_md5=None,
+        reply_image_basename=None,
+    ):
+        assert group_id == "123"
+        return dict(zip(("a" * 32, "b" * 32), quotes)).get(reply_image_md5)
+
+    monkeypatch.setattr(manage_commands, "V11Bot", _Bot)
+    monkeypatch.setattr(manage_commands, "reply_fetch", _fake_reply_fetch)
+    monkeypatch.setattr(manage_commands, "is_reply_to_bot", _fake_is_reply_to_bot)
+    monkeypatch.setattr(
+        manage_commands.QuoteService,
+        "find_quote_by_reply_image",
+        _fake_find,
+    )
+
+    resolution = await manage_commands._get_quotes_from_reply(
+        _Bot(),
+        SimpleNamespace(),
+        SimpleNamespace(group=SimpleNamespace(id="123")),
+    )
+
+    assert resolution.quotes == quotes
+    assert resolution.image_count == 2
+    assert resolution.unresolved_count == 0
 
 
 @pytest.mark.asyncio
@@ -1673,7 +1842,9 @@ async def test_make_record_handle_writes_dual_mention_tags(monkeypatch, tmp_path
         upload_commands.QuoteService, "add_quote", _fake_add_quote
     )
     monkeypatch.setattr(
-        upload_commands.MessageUtils, "build_message", lambda payload: _FakeMessage(payload)
+        upload_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
     )
 
     event = SimpleNamespace(get_user_id=lambda: "42")
@@ -1688,6 +1859,60 @@ async def test_make_record_handle_writes_dual_mention_tags(monkeypatch, tmp_path
     assert captured["manual_tags"] == ["user:114514", "群主_张三"]
     assert sent_messages == [
         upload_commands._build_record_success_message(b"generated-image")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_make_record_reports_duplicate_in_recycle_bin(monkeypatch):
+    sent_messages: list[object] = []
+
+    async def _fake_extract_tags(bot, group_id, arp, arg_name="parts"):
+        return []
+
+    async def _fake_handle_generation(bot, event, arp, session, issuer_user_id=None):
+        return b"generated-image", "recorded text", "114514", None
+
+    class _RecycledQuery:
+        async def first(self):
+            return SimpleNamespace(deleted_at=quote_service_module.timezone.now())
+
+    class _FakeMessage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def send(self, target=None, bot=None):
+            sent_messages.append(self.payload)
+
+    monkeypatch.setattr(
+        upload_commands,
+        "extract_manual_tags_with_mention_names",
+        _fake_extract_tags,
+    )
+    monkeypatch.setattr(
+        upload_commands,
+        "_handle_quote_generation",
+        _fake_handle_generation,
+    )
+    monkeypatch.setattr(
+        upload_commands.Quote,
+        "filter",
+        lambda **kwargs: _RecycledQuery(),
+    )
+    monkeypatch.setattr(
+        upload_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
+    )
+
+    await upload_commands.make_record_handle(
+        SimpleNamespace(),
+        SimpleNamespace(get_user_id=lambda: "42"),
+        SimpleNamespace(all_matched_args={}, main_args={}),
+        SimpleNamespace(group=SimpleNamespace(id="123")),
+    )
+
+    assert sent_messages == [
+        "该语录位于回收站，请回复原语录使用「恢复语录」恢复。"
     ]
 
 
@@ -1740,7 +1965,9 @@ async def test_idiom_record_handle_forces_classic_and_reuses_record_flow(
     )
     monkeypatch.setattr(upload_commands.QuoteService, "add_quote", _fake_add_quote)
     monkeypatch.setattr(
-        upload_commands.MessageUtils, "build_message", lambda payload: _FakeMessage(payload)
+        upload_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
     )
 
     event = SimpleNamespace(get_user_id=lambda: "42")
@@ -1783,7 +2010,9 @@ async def test_idiom_record_handle_rejects_style_override(monkeypatch):
     )
 
     monkeypatch.setattr(
-        upload_commands.MessageUtils, "build_message", lambda payload: _FakeMessage(payload)
+        upload_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
     )
     monkeypatch.setattr(
         upload_commands, "_handle_quote_generation", _fake_handle_generation
@@ -1819,7 +2048,9 @@ async def test_handle_quote_generation_forced_classic_rejects_pure_image_message
     monkeypatch.setattr(
         upload_commands.Config,
         "get_config",
-        lambda module, key, default=None: False if key.startswith("QUOTE_ALLOW") else default,
+        lambda module, key, default=None: (
+            False if key.startswith("QUOTE_ALLOW") else default
+        ),
     )
 
     class _FakeBot:
@@ -1842,13 +2073,15 @@ async def test_handle_quote_generation_forced_classic_rejects_pure_image_message
         group_id=123,
     )
 
-    img_data, recorded_text, quoted_user_id, error = await upload_commands._handle_quote_generation(
-        _FakeBot(),
-        event,
-        _FakeArp(),
-        SimpleNamespace(group=SimpleNamespace(id="123")),
-        issuer_user_id="42",
-        forced_variant="classic",
+    img_data, recorded_text, quoted_user_id, error = (
+        await upload_commands._handle_quote_generation(
+            _FakeBot(),
+            event,
+            _FakeArp(),
+            SimpleNamespace(group=SimpleNamespace(id="123")),
+            issuer_user_id="42",
+            forced_variant="classic",
+        )
     )
 
     assert img_data is None
@@ -1862,14 +2095,14 @@ async def test_handle_quote_tag_add_uses_dual_mention_tags(monkeypatch):
     quote = SimpleNamespace(id=1)
     captured: dict[str, object] = {}
 
-    async def _fake_get_quote_from_reply(bot, event, session):
-        return quote
+    async def _fake_require_reply_quotes(bot, event, session):
+        return manage_commands.ReplyQuoteResolution([quote], image_count=1)
 
     async def _fake_extract_tags(bot, group_id, arp, arg_name="parts"):
         assert group_id == "123"
         return ["user:114514", "群主_张三"]
 
-    async def _fake_update(bot, event, quote_arg, tags, action):
+    async def _fake_update(bot, event, quote_arg, tags, action, unresolved_count=0):
         captured["quote"] = quote_arg
         captured["tags"] = tags
         captured["action"] = action
@@ -1878,7 +2111,9 @@ async def test_handle_quote_tag_add_uses_dual_mention_tags(monkeypatch):
         def query(self, key, default=""):
             return "add" if key == "action" else default
 
-    monkeypatch.setattr(manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply)
+    monkeypatch.setattr(
+        manage_commands, "_require_reply_quotes", _fake_require_reply_quotes
+    )
     monkeypatch.setattr(
         manage_commands,
         "extract_manual_tags_with_mention_names",
@@ -1896,7 +2131,7 @@ async def test_handle_quote_tag_add_uses_dual_mention_tags(monkeypatch):
     )
 
     assert captured == {
-        "quote": quote,
+        "quote": [quote],
         "tags": ["user:114514", "群主_张三"],
         "action": "add",
     }
@@ -1907,20 +2142,20 @@ async def test_handle_quote_deltag_uses_dual_mention_tags(monkeypatch):
     quote = SimpleNamespace(id=1)
     captured: dict[str, object] = {}
 
-    async def _fake_require_reply_quote(bot, event, session):
-        return quote
+    async def _fake_require_reply_quotes(bot, event, session):
+        return manage_commands.ReplyQuoteResolution([quote], image_count=1)
 
     async def _fake_extract_tags(bot, group_id, arp, arg_name="parts"):
         assert group_id == "123"
         return ["user:114514", "群主_张三"]
 
-    async def _fake_update(bot, event, quote_arg, tags, action):
+    async def _fake_update(bot, event, quote_arg, tags, action, unresolved_count=0):
         captured["quote"] = quote_arg
         captured["tags"] = tags
         captured["action"] = action
 
     monkeypatch.setattr(
-        manage_commands, "_require_reply_quote", _fake_require_reply_quote
+        manage_commands, "_require_reply_quotes", _fake_require_reply_quotes
     )
     monkeypatch.setattr(
         manage_commands,
@@ -1939,10 +2174,351 @@ async def test_handle_quote_deltag_uses_dual_mention_tags(monkeypatch):
     )
 
     assert captured == {
-        "quote": quote,
+        "quote": [quote],
         "tags": ["user:114514", "群主_张三"],
         "action": "del",
     }
+
+
+@pytest.mark.asyncio
+async def test_build_tag_view_message_lists_unified_tags_for_multiple_quotes():
+    quotes = [
+        SimpleNamespace(
+            group_id="123",
+            uploader_user_id="42",
+            tags=["自动一"],
+            manual_tags=["手动一"],
+        ),
+        SimpleNamespace(
+            group_id="123",
+            uploader_user_id=None,
+            tags=["自动二"],
+            manual_tags=["手动二"],
+        ),
+    ]
+
+    message = await manage_commands._build_tag_view_message(quotes)
+    text = "".join(
+        part.text if isinstance(part, Text) else str(part) for part in message
+    )
+
+    assert "1. tag：手动一；自动一" in text
+    assert "2. tag：手动二；自动二" in text
+    assert "上传者：42" in text
+    assert "上传者：未知" in text
+    assert all(not isinstance(part, Image) for part in message)
+
+
+@pytest.mark.asyncio
+async def test_build_tag_view_message_resolves_and_caches_uploader_card():
+    calls: list[tuple[int, int]] = []
+
+    class _Bot:
+        async def get_group_member_info(self, *, group_id: int, user_id: int):
+            calls.append((group_id, user_id))
+            return {"card": "群名片", "nickname": "昵称"}
+
+    quotes = [
+        SimpleNamespace(
+            group_id="123",
+            uploader_user_id="42",
+            tags=[],
+            manual_tags=[],
+        ),
+        SimpleNamespace(
+            group_id="123",
+            uploader_user_id="42",
+            tags=[],
+            manual_tags=[],
+        ),
+    ]
+
+    message = await manage_commands._build_tag_view_message(quotes, bot=_Bot())
+    text = "".join(map(str, message))
+
+    assert text.count("上传者：群名片（42）") == 2
+    assert calls == [(123, 42)]
+
+
+@pytest.mark.asyncio
+async def test_build_tag_view_message_falls_back_to_uploader_qq():
+    class _Bot:
+        async def get_group_member_info(self, **kwargs):
+            raise RuntimeError("member unavailable")
+
+    quote = SimpleNamespace(
+        group_id="123",
+        uploader_user_id="42",
+        tags=[],
+        manual_tags=[],
+    )
+
+    message = await manage_commands._build_tag_view_message(quote, bot=_Bot())
+
+    assert "上传者：42" in "".join(map(str, message))
+
+
+@pytest.mark.asyncio
+async def test_get_quotes_from_reply_resolves_all_images_in_order_and_deduplicates(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    first = SimpleNamespace(id=1)
+    second = SimpleNamespace(id=2)
+    image_one = manage_commands.Image(id="a" * 32 + ".png")
+    image_two = manage_commands.Image(id="b" * 32 + ".png")
+    image_duplicate = manage_commands.Image(id="a" * 32 + ".PNG")
+
+    async def _fake_is_reply_to_bot(event):
+        return True
+
+    async def _fake_get_images(event, bot):
+        return [image_one, image_two, image_duplicate], 1
+
+    async def _fake_find(group_id, reply_image_md5=None, reply_image_basename=None):
+        return {"a" * 32: first, "b" * 32: second}.get(reply_image_md5)
+
+    monkeypatch.setattr(manage_commands, "is_reply_to_bot", _fake_is_reply_to_bot)
+    monkeypatch.setattr(manage_commands, "_get_images_from_reply", _fake_get_images)
+    monkeypatch.setattr(
+        manage_commands.QuoteService,
+        "find_quote_by_reply_image",
+        _fake_find,
+    )
+
+    resolution = await manage_commands._get_quotes_from_reply(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(group=SimpleNamespace(id="123")),
+    )
+
+    assert resolution.quotes == [first, second]
+    assert resolution.image_count == 3
+    assert resolution.unresolved_count == 1
+
+
+@pytest.mark.asyncio
+async def test_update_quote_manual_tags_applies_to_multiple_quotes(monkeypatch):
+    quotes = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+    calls: list[int] = []
+    sent_messages: list[object] = []
+
+    async def _fake_add(quote, tags):
+        calls.append(quote.id)
+        return quote_service_module.TagMutationResult(True, tags, tags)
+
+    class _FakeMessage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def send(self, target=None, bot=None):
+            sent_messages.append(self.payload)
+
+    monkeypatch.setattr(manage_commands.QuoteService, "add_manual_tags", _fake_add)
+    monkeypatch.setattr(
+        manage_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
+    )
+
+    await manage_commands._update_quote_manual_tags(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        quotes,
+        ["batch"],
+        "add",
+    )
+
+    assert calls == [1, 2]
+    assert "1. 当前 tag：" in "".join(map(str, sent_messages[0]))
+    assert "2. 当前 tag：" in "".join(map(str, sent_messages[0]))
+
+
+@pytest.mark.asyncio
+async def test_delete_multiple_quotes_preflights_permissions_before_deleting(
+    monkeypatch,
+):
+    quotes = [
+        SimpleNamespace(id=1, uploader_user_id="42"),
+        SimpleNamespace(id=2, uploader_user_id="99"),
+    ]
+    delete_calls: list[int] = []
+    sent_messages: list[object] = []
+
+    async def _fake_check(bot, event, session, quote=None):
+        return quote.uploader_user_id == "42"
+
+    async def _fake_delete(quote, deleted_by_user_id=None):
+        delete_calls.append(quote.id)
+        return True
+
+    class _FakeMessage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def send(self, target=None, bot=None):
+            sent_messages.append(self.payload)
+
+    monkeypatch.setattr(manage_commands, "uploader_or_admin_check", _fake_check)
+    monkeypatch.setattr(
+        manage_commands.QuoteService, "delete_quote_instance", _fake_delete
+    )
+    monkeypatch.setattr(
+        manage_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
+    )
+
+    await manage_commands._handle_delete_reply_quote(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(
+            group=SimpleNamespace(id="123"),
+            user=SimpleNamespace(id="42"),
+        ),
+        quote=quotes,
+    )
+
+    assert delete_calls == []
+    assert "已取消整批删除" in str(sent_messages[0])
+
+
+@pytest.mark.asyncio
+async def test_delete_multiple_quotes_deletes_all_after_permission_preflight(
+    monkeypatch,
+):
+    quotes = [
+        SimpleNamespace(id=1, uploader_user_id="42"),
+        SimpleNamespace(id=2, uploader_user_id="42"),
+    ]
+    delete_calls: list[int] = []
+    sent_messages: list[object] = []
+
+    async def _fake_check(bot, event, session, quote=None):
+        return True
+
+    async def _fake_delete(quote, deleted_by_user_id=None):
+        delete_calls.append(quote.id)
+        return True
+
+    class _FakeMessage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def send(self, target=None, bot=None):
+            sent_messages.append(self.payload)
+
+    monkeypatch.setattr(manage_commands, "uploader_or_admin_check", _fake_check)
+    monkeypatch.setattr(
+        manage_commands.QuoteService, "delete_quote_instance", _fake_delete
+    )
+    monkeypatch.setattr(
+        manage_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
+    )
+
+    await manage_commands._handle_delete_reply_quote(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(
+            group=SimpleNamespace(id="123"),
+            user=SimpleNamespace(id="42"),
+        ),
+        quote=quotes,
+    )
+
+    assert delete_calls == [1, 2]
+    response_text = "".join(map(str, sent_messages[0]))
+    assert "已移入回收站，共 2 条" in response_text
+    assert "回复原语录发送「恢复语录」可恢复" in response_text
+
+
+@pytest.mark.asyncio
+async def test_restore_multiple_quotes_preflights_permissions(monkeypatch):
+    quotes = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+    restore_calls: list[int] = []
+    sent_messages: list[object] = []
+
+    async def _fake_check(bot, event, session, quote):
+        return quote.id == 1
+
+    async def _fake_restore(quote):
+        restore_calls.append(quote.id)
+        return True
+
+    class _FakeMessage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def send(self, target=None, bot=None):
+            sent_messages.append(self.payload)
+
+    monkeypatch.setattr(manage_commands, "deleter_or_admin_check", _fake_check)
+    monkeypatch.setattr(
+        manage_commands.QuoteService,
+        "restore_quote_instance",
+        _fake_restore,
+    )
+    monkeypatch.setattr(
+        manage_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
+    )
+
+    await manage_commands._handle_restore_reply_quote(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(user=SimpleNamespace(id="42")),
+        manage_commands.ReplyQuoteResolution(quotes),
+    )
+
+    assert restore_calls == []
+    assert "已取消整批恢复" in str(sent_messages[0])
+
+
+@pytest.mark.asyncio
+async def test_restore_multiple_quotes_restores_all_after_permission_preflight(
+    monkeypatch,
+):
+    quotes = [SimpleNamespace(id=1), SimpleNamespace(id=2)]
+    restore_calls: list[int] = []
+    sent_messages: list[object] = []
+
+    async def _fake_check(bot, event, session, quote):
+        return True
+
+    async def _fake_restore(quote):
+        restore_calls.append(quote.id)
+        return True
+
+    class _FakeMessage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def send(self, target=None, bot=None):
+            sent_messages.append(self.payload)
+
+    monkeypatch.setattr(manage_commands, "deleter_or_admin_check", _fake_check)
+    monkeypatch.setattr(
+        manage_commands.QuoteService,
+        "restore_quote_instance",
+        _fake_restore,
+    )
+    monkeypatch.setattr(
+        manage_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
+    )
+
+    await manage_commands._handle_restore_reply_quote(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(user=SimpleNamespace(id="42")),
+        manage_commands.ReplyQuoteResolution(quotes),
+    )
+
+    assert restore_calls == [1, 2]
+    assert "恢复成功，共 2 条" in "".join(map(str, sent_messages[0]))
 
 
 @pytest.mark.parametrize(
@@ -2053,17 +2629,19 @@ async def test_delete_quote_standalone_prefers_reply_quote(monkeypatch):
     reply_quote = SimpleNamespace(id=42)
     calls = {"reply": 0, "last": 0}
 
-    async def _fake_get_quote_from_reply(bot, event, session):
-        return reply_quote
+    async def _fake_get_quotes_from_reply(bot, event, session):
+        return manage_commands.ReplyQuoteResolution([reply_quote], image_count=1)
 
     async def _fake_handle_delete_reply_quote(bot, event, session, quote=None):
         calls["reply"] += 1
-        assert quote is reply_quote
+        assert quote.quotes == [reply_quote]
 
     async def _fake_handle_delete_last_quote(bot, event, session):
         calls["last"] += 1
 
-    monkeypatch.setattr(manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply)
+    monkeypatch.setattr(
+        manage_commands, "_get_quotes_from_reply", _fake_get_quotes_from_reply
+    )
     monkeypatch.setattr(
         manage_commands, "_handle_delete_reply_quote", _fake_handle_delete_reply_quote
     )
@@ -2085,8 +2663,8 @@ async def test_delete_quote_standalone_without_reply_only_sends_guidance(monkeyp
     calls = {"reply": 0, "last": 0}
     sent_messages: list[object] = []
 
-    async def _fake_get_quote_from_reply(bot, event, session):
-        return None
+    async def _fake_get_quotes_from_reply(bot, event, session):
+        return manage_commands.ReplyQuoteResolution([])
 
     async def _fake_handle_delete_reply_quote(bot, event, session, quote=None):
         calls["reply"] += 1
@@ -2101,7 +2679,9 @@ async def test_delete_quote_standalone_without_reply_only_sends_guidance(monkeyp
         async def send(self, target=None, bot=None):
             sent_messages.append(self.payload)
 
-    monkeypatch.setattr(manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply)
+    monkeypatch.setattr(
+        manage_commands, "_get_quotes_from_reply", _fake_get_quotes_from_reply
+    )
     monkeypatch.setattr(
         manage_commands, "_handle_delete_reply_quote", _fake_handle_delete_reply_quote
     )
@@ -2109,7 +2689,9 @@ async def test_delete_quote_standalone_without_reply_only_sends_guidance(monkeyp
         manage_commands, "_handle_delete_last_quote", _fake_handle_delete_last_quote
     )
     monkeypatch.setattr(
-        manage_commands.MessageUtils, "build_message", lambda payload: _FakeMessage(payload)
+        manage_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
     )
 
     session = SimpleNamespace(group=SimpleNamespace(id="123"))
@@ -2139,7 +2721,7 @@ async def test_handle_delete_reply_quote_reuses_cached_state_quote(
     async def _fake_uploader_or_admin_check(bot, event, session, quote=None):
         return quote is cached_quote
 
-    async def _fake_delete_quote_instance(quote):
+    async def _fake_delete_quote_instance(quote, deleted_by_user_id=None):
         deleted_quotes.append(quote)
         return True
 
@@ -2150,15 +2732,21 @@ async def test_handle_delete_reply_quote_reuses_cached_state_quote(
         async def send(self, target=None, bot=None):
             sent_messages.append(self.payload)
 
-    monkeypatch.setattr(manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply)
+    monkeypatch.setattr(
+        manage_commands, "_get_quote_from_reply", _fake_get_quote_from_reply
+    )
     monkeypatch.setattr(
         manage_commands, "uploader_or_admin_check", _fake_uploader_or_admin_check
     )
     monkeypatch.setattr(
-        manage_commands.QuoteService, "delete_quote_instance", _fake_delete_quote_instance
+        manage_commands.QuoteService,
+        "delete_quote_instance",
+        _fake_delete_quote_instance,
     )
     monkeypatch.setattr(
-        manage_commands.MessageUtils, "build_message", lambda payload: _FakeMessage(payload)
+        manage_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
     )
 
     session = SimpleNamespace(
@@ -2360,7 +2948,7 @@ async def test_audit_storage_limits_issue_details_without_truncating_counts(
 
 
 @pytest.mark.asyncio
-async def test_delete_quote_restores_file_when_database_delete_fails(
+async def test_purge_quote_restores_file_when_database_delete_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     image_path = tmp_path / "quote.png"
@@ -2378,14 +2966,14 @@ async def test_delete_quote_restores_file_when_database_delete_fails(
         quote_service_module.Quote, "filter", lambda **kwargs: _FailingDeleteQuery()
     )
 
-    result = await QuoteService.delete_quote_instance(quote)
+    result = await QuoteService.purge_quote_instance(quote)
 
     assert result is False
     assert image_path.read_bytes() == b"image"
 
 
 @pytest.mark.asyncio
-async def test_concurrent_delete_does_not_restore_orphan_file(
+async def test_concurrent_purge_does_not_restore_orphan_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
@@ -2418,9 +3006,9 @@ async def test_concurrent_delete_does_not_restore_orphan_file(
     )
     monkeypatch.setattr(quote_service_module.Quote, "filter", _filter)
 
-    first_task = asyncio.create_task(QuoteService.delete_quote_instance(quote))
+    first_task = asyncio.create_task(QuoteService.purge_quote_instance(quote))
     await first_delete_started.wait()
-    second_task = asyncio.create_task(QuoteService.delete_quote_instance(quote))
+    second_task = asyncio.create_task(QuoteService.purge_quote_instance(quote))
     await asyncio.sleep(0)
     allow_first_delete.set()
 
@@ -2515,6 +3103,329 @@ def test_deletion_keyword_matching_includes_manual_and_auto_tags():
     assert not QuoteService.matches_deletion_keywords(quote, ["不存在"])
 
 
+@pytest.fixture
+async def quote_tag_database(tmp_path: Path):
+    await Tortoise.init(
+        db_url=f"sqlite://{tmp_path / 'quote-tag.sqlite3'}",
+        modules={"models": [f"{PLUGIN_PACKAGE}.model"]},
+    )
+    await Tortoise.generate_schemas()
+    try:
+        yield
+    finally:
+        await Tortoise.close_connections()
+
+
+async def _create_tagged_quote(
+    quote_id: int,
+    tags: list[str],
+    *,
+    group_id: str = "123",
+):
+    quote = await Quote.create(
+        id=quote_id,
+        group_id=group_id,
+        image_path=f"quote/images/{quote_id}.png",
+        tags=[],
+        manual_tags=tags,
+        tag_schema_version=1,
+    )
+    await QuoteService._replace_quote_tag_links(quote, tags)
+    return quote
+
+
+@pytest.mark.asyncio
+async def test_legacy_tag_migration_merges_json_and_resumes(quote_tag_database):
+    quote = await Quote.create(
+        group_id="123",
+        image_path="quote/images/legacy.png",
+        tags=["自动", "重复"],
+        manual_tags='["手动", "重复"]',
+        tag_schema_version=0,
+    )
+
+    assert await QuoteService.migrate_legacy_tags(batch_size=1) == 1
+
+    migrated = await Quote.get(id=quote.id)
+    assert migrated.tag_schema_version == 1
+    assert migrated.tags == []
+    assert migrated.manual_tags == ["手动", "重复", "自动"]
+    assert await QuoteService.get_quote_tags(migrated) == ["手动", "重复", "自动"]
+    assert await QuoteService.migrate_legacy_tags(batch_size=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_soft_delete_and_restore_preserve_quote_evidence(
+    quote_tag_database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    image_path = tmp_path / "quote.png"
+    image_path.write_bytes(b"image")
+    quote = await _create_tagged_quote(1, ["tag"])
+    quote.uploader_user_id = "42"
+    await quote.save(update_fields=["uploader_user_id"])
+    monkeypatch.setattr(
+        quote_service_module,
+        "resolve_quote_image_path",
+        lambda path: image_path,
+    )
+
+    assert await QuoteService.delete_quote_instance(
+        quote,
+        deleted_by_user_id="99",
+    )
+
+    recycled = await Quote.get(id=quote.id)
+    assert recycled.deleted_at is not None
+    assert recycled.deleted_by_user_id == "99"
+    assert recycled.uploader_user_id == "42"
+    assert image_path.read_bytes() == b"image"
+    assert await QuoteService.active_quotes(id=quote.id).count() == 0
+    assert await QuoteTagLink.filter(quote_id=quote.id).count() == 1
+    assert await QuoteService.get_random_quote_ids("123") == []
+    assert await QuoteService.search_quotes("123", "tag", tag_only=True) == []
+    assert await QuoteService.get_all_quotes() == []
+
+    assert await QuoteService.restore_quote_instance(recycled)
+
+    restored = await Quote.get(id=quote.id)
+    assert restored.deleted_at is None
+    assert restored.deleted_by_user_id is None
+    assert restored.uploader_user_id == "42"
+    assert await QuoteService.get_quote_tags(restored) == ["tag"]
+
+
+@pytest.mark.asyncio
+async def test_restore_quote_rejects_missing_image(
+    quote_tag_database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    quote = await Quote.create(
+        group_id="123",
+        image_path="quote/images/missing.png",
+        deleted_at=quote_service_module.timezone.now(),
+        deleted_by_user_id="42",
+    )
+    monkeypatch.setattr(
+        quote_service_module,
+        "resolve_quote_image_path",
+        lambda path: tmp_path / "missing.png",
+    )
+
+    assert await QuoteService.restore_quote_instance(quote) is False
+    assert (await Quote.get(id=quote.id)).deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_quotes_keeps_fresh_and_is_idempotent(
+    quote_tag_database,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    now = quote_service_module.timezone.now()
+    expired_image = tmp_path / "expired.png"
+    fresh_image = tmp_path / "fresh.png"
+    expired_image.write_bytes(b"expired")
+    fresh_image.write_bytes(b"fresh")
+    expired = await Quote.create(
+        group_id="123",
+        image_path="quote/images/expired.png",
+        deleted_at=now - timedelta(days=8),
+        deleted_by_user_id="42",
+    )
+    missing = await Quote.create(
+        group_id="123",
+        image_path="quote/images/missing-expired.png",
+        deleted_at=now - timedelta(days=8),
+        deleted_by_user_id="42",
+    )
+    fresh = await Quote.create(
+        group_id="123",
+        image_path="quote/images/fresh.png",
+        deleted_at=now - timedelta(days=6),
+        deleted_by_user_id="42",
+    )
+    paths = {
+        expired.image_path: expired_image,
+        missing.image_path: tmp_path / "missing-expired.png",
+        fresh.image_path: fresh_image,
+    }
+    monkeypatch.setattr(
+        quote_service_module,
+        "resolve_quote_image_path",
+        lambda path: paths[str(path)],
+    )
+
+    result = await QuoteService.purge_expired_quotes(now=now)
+
+    assert result == quote_service_module.QuotePurgeSummary(purged=2, failed=0)
+    assert not await Quote.filter(id__in=[expired.id, missing.id]).exists()
+    assert await Quote.filter(id=fresh.id).exists()
+    assert not expired_image.exists()
+    assert fresh_image.read_bytes() == b"fresh"
+    assert await QuoteService.purge_expired_quotes(now=now) == (
+        quote_service_module.QuotePurgeSummary(purged=0, failed=0)
+    )
+
+
+@pytest.mark.asyncio
+async def test_tag_alias_query_unlink_and_group_delete(quote_tag_database):
+    first = await _create_tagged_quote(1, ["xc", "小葱"])
+    second = await _create_tagged_quote(2, ["小葱"])
+    third = await _create_tagged_quote(3, ["xctest"])
+    legacy = await Quote.create(
+        id=4,
+        group_id="123",
+        image_path="quote/images/legacy-alias.png",
+        tags=["user:114514"],
+        manual_tags=[],
+        tag_schema_version=0,
+    )
+
+    linked = await QuoteService.link_tag_aliases(
+        "123", ["xc", "小葱", "user:114514"]
+    )
+    assert linked.members == ["xc", "小葱", "user:114514"]
+    assert await QuoteService.get_quote_tag_groups(first) == [
+        ["xc", "小葱", "user:114514"]
+    ]
+
+    strict_matches = await QuoteService.search_quotes("123", "xc", tag_only=True)
+    assert {quote.id for quote in strict_matches} == {1, 2, 4}
+    mixed_matches = await QuoteService.search_quotes("123", "xc")
+    assert {quote.id for quote in mixed_matches} == {1, 2, 3, 4}
+    user_matches = await QuoteService.get_quote_ids_for_user("123", "114514")
+    assert set(user_matches) == {1, 2, 4}
+
+    deleted = await QuoteService.delete_manual_tags(first, ["xc"])
+    assert deleted.success is True
+    assert set(deleted.changed_tags) == {"xc", "小葱"}
+    assert await QuoteService.get_quote_tags(first) == []
+    assert await QuoteService.get_quote_tags(second) == ["小葱"]
+
+    await QuoteService.unlink_tag_alias("123", "小葱")
+    assert {quote.id for quote in await QuoteService.search_quotes(
+        "123", "小葱", tag_only=True
+    )} == {2}
+    assert {quote.id for quote in await QuoteService.search_quotes(
+        "123", "xc", tag_only=True
+    )} == {4}
+    await QuoteService.unlink_tag_alias("123", "user:114514")
+    assert {quote.id for quote in await QuoteService.search_quotes(
+        "123", "xc", tag_only=True
+    )} == set()
+    assert {quote.id for quote in await QuoteService.search_quotes(
+        "123", "user:114514", tag_only=True
+    )} == {4}
+    assert await QuoteService.get_quote_tags(third) == ["xctest"]
+    assert await QuoteService.get_quote_tags(legacy) == ["user:114514"]
+
+
+@pytest.mark.asyncio
+async def test_linking_multiple_alias_groups_requires_confirmation(quote_tag_database):
+    await QuoteService.link_tag_aliases("123", ["a", "b"])
+    await QuoteService.link_tag_aliases("123", ["c", "d"])
+
+    preview = await QuoteService.preview_tag_alias_link("123", ["b", "c"])
+    assert preview.requires_confirmation is True
+    assert preview.existing_group_count == 2
+
+    blocked = await QuoteService.link_tag_aliases("123", ["b", "c"])
+    assert blocked.requires_confirmation is True
+    assert set(await QuoteService.get_tag_alias_group("123", "a")) == {"a", "b"}
+
+    merged = await QuoteService.link_tag_aliases(
+        "123", ["b", "c"], confirm_merge=True
+    )
+    assert set(merged.members) == {"a", "b", "c", "d"}
+
+
+@pytest.mark.asyncio
+async def test_relation_tag_search_never_loads_full_group_quotes(
+    quote_tag_database, monkeypatch: pytest.MonkeyPatch
+):
+    await _create_tagged_quote(1, ["xc"])
+    original_filter = Quote.filter
+    filter_calls: list[dict] = []
+
+    def _tracked_filter(*args, **kwargs):
+        filter_calls.append(dict(kwargs))
+        return original_filter(*args, **kwargs)
+
+    monkeypatch.setattr(Quote, "filter", _tracked_filter)
+
+    matches = await QuoteService.search_quotes("123", "xc", tag_only=True)
+
+    assert [quote.id for quote in matches] == [1]
+    assert all(
+        "tag_schema_version" in call or "id__in" in call
+        for call in filter_calls
+        if call.get("group_id") == "123"
+    )
+
+
+@pytest.mark.asyncio
+async def test_keyword_search_tokenizes_once_per_request(
+    quote_tag_database, monkeypatch: pytest.MonkeyPatch
+):
+    quote = await _create_tagged_quote(1, [])
+    quote.recorded_text = "alpha middle beta"
+    await quote.save(update_fields=["recorded_text"])
+    cut_calls: list[str | None] = []
+
+    def _fake_cut_sentence(text: str | None) -> list[str]:
+        cut_calls.append(text)
+        return ["alpha", "beta"]
+
+    monkeypatch.setattr(QuoteService, "cut_sentence", _fake_cut_sentence)
+
+    matches = await QuoteService.search_quotes("123", "alpha beta")
+
+    assert [quote.id for quote in matches] == [1]
+    assert cut_calls == ["alpha beta"]
+
+
+@pytest.mark.asyncio
+async def test_prolific_chart_batches_user_profile_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    filter_calls: list[dict] = []
+
+    class _UserQuery:
+        def __await__(self):
+            async def _resolve():
+                return [
+                    SimpleNamespace(user_id="1", user_name="用户一"),
+                    SimpleNamespace(user_id="2", user_name="用户二"),
+                ]
+
+            return _resolve().__await__()
+
+    def _filter(**kwargs):
+        filter_calls.append(kwargs)
+        return _UserQuery()
+
+    async def _fake_barh(data):
+        return b"chart"
+
+    monkeypatch.setattr(quote_service_module.GroupInfoUser, "filter", _filter)
+    monkeypatch.setattr(quote_service_module.ChartUtils, "barh", _fake_barh)
+
+    result = await QuoteService.generate_bar_chart_for_prolific_users(
+        "123",
+        [
+            {"uploader_user_id": "1", "upload_count": 3},
+            {"uploader_user_id": "2", "upload_count": 2},
+        ],
+        "高产上传",
+    )
+
+    assert result == b"chart"
+    assert filter_calls == [{"group_id": "123", "user_id__in": ["1", "2"]}]
+
+
 @pytest.mark.asyncio
 async def test_private_quote_query_sends_group_only_guidance(
     monkeypatch: pytest.MonkeyPatch,
@@ -2540,6 +3451,53 @@ async def test_private_quote_query_sends_group_only_guidance(
     )
 
     assert sent_messages == ["请在群聊中使用语录查询。"]
+
+
+@pytest.mark.asyncio
+async def test_strict_tag_query_does_not_fallback_to_random(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sent_messages: list[object] = []
+
+    class _FakeMessage:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def send(self, target=None, bot=None):
+            sent_messages.append(self.payload)
+
+    class _Arparma:
+        all_matched_args = {"search_keywords": ["#不存在"]}
+
+        def query(self, key, default=None):
+            return default
+
+    async def _fake_search_quotes(*args, **kwargs):
+        assert kwargs["tag_only"] is True
+        return []
+
+    async def _fail_random(*args, **kwargs):
+        raise AssertionError("严格 tag 查询不得回退随机语录")
+
+    monkeypatch.setattr(QuoteService, "search_quotes", _fake_search_quotes)
+    monkeypatch.setattr(query_commands, "_get_valid_random_quotes", _fail_random)
+    monkeypatch.setattr(
+        query_commands.MessageUtils,
+        "build_message",
+        lambda payload: _FakeMessage(payload),
+    )
+    monkeypatch.setattr(
+        query_commands.PlatformUtils,
+        "get_target",
+        lambda **kwargs: SimpleNamespace(),
+    )
+    event = SimpleNamespace(get_session_id=lambda: "group_123_42")
+
+    await query_commands.record_pool_handle(
+        SimpleNamespace(), event, _Arparma(), {}
+    )
+
+    assert sent_messages == ["未找到 tag「不存在」对应的语录。"]
 
 
 @pytest.mark.asyncio
