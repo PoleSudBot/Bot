@@ -66,7 +66,6 @@ __plugin_meta__ = PluginMetadata(
         "`上传语录 [图片] [tag/@用户 ...]` - 上传图片作为语录，也可回复图片后发送 `上传语录`\n"
         "回复合并转发后发送 `上传语录`，会批量上传其中所有顶层图片\n"
         "示例：回复图片或合并转发后发送 `上传语录 南极`、`上传语录 [图片] 南极 @南极`\n\n"
-        "`上传` - 迁移提示命令，会提示改用 `上传语录`\n\n"
         "`记录语录 [tag/@用户 ...]` - 回复文本消息后生成语录图片并保存，`记录` 为兼容别名\n"
         "示例：回复消息后发送 `记录语录 南极`、`记录语录`、`记录 @南极 经典`\n\n"
         "`入典 [tag/@用户 ...]` - 固定使用 classic 风格记录语录，需回复消息\n"
@@ -91,7 +90,7 @@ __plugin_meta__ = PluginMetadata(
         "`addtag` / `deltag` / `tagadd` / `tagdel` - `tag add/del` 的等价别名\n\n"
         "`taglink tag1 tag2 ...` - 创建或扩展当前群互通组，别名：`tag互通`、`标签互通`\n"
         "`tagunlink tag` - 将一个成员移出互通组，别名：`取消互通`\n"
-        "`taggroup tag` - 查看成员所在互通组，别名：`tag组`、`互通组`\n\n"
+        "`taggroup tag` - 查看成员所在互通组，别名：`tag组`、`tag别名`、`互通组`\n\n"
         "`语录管理 keyword 词1 ...` - 删除包含任一关键词的语录，仅超级用户可用\n"
         "`语录管理 clear --uploader @用户/QQ号` - 清空指定上传者的语录，仅超级用户可用\n"
         "`语录管理 clear --quoted @用户/QQ号` - 清空指定被记录用户的语录，仅超级用户可用\n"
@@ -115,7 +114,7 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="v1.4.0",
+        version="v1.4.1",
         admin_level=0,
         configs=[
             RegisterConfig(

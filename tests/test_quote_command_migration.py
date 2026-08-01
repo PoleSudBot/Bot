@@ -97,16 +97,6 @@ def _extract_texts(parts) -> list[str]:
     return [getattr(part, "text", str(part)) for part in parts]
 
 
-def test_legacy_upload_parser_would_swallow_new_command_without_guard():
-    parsed = upload_commands.upload_hint_cmd.command().parse("上传语录 南极")
-
-    assert parsed.matched
-    assert _extract_texts(parsed.query("parts")) == ["语录", "南极"]
-    assert upload_commands._is_new_upload_command_text("上传语录 南极")
-    assert upload_commands._is_new_upload_command_text("/上传语录南极")
-    assert not upload_commands._is_new_upload_command_text("上传 南极")
-
-
 def test_new_upload_command_keeps_compact_old_capability():
     parsed = upload_commands.save_img_cmd.command().parse("上传语录南极")
 
@@ -114,14 +104,9 @@ def test_new_upload_command_keeps_compact_old_capability():
     assert _extract_texts(parsed.query("parts")) == ["南极"]
 
 
-def test_upload_migration_and_success_prompt_share_new_usage_hint():
-    migration_hint = upload_commands._build_upload_migration_hint_text()
+def test_upload_success_prompt_contains_basic_usage_hint():
     success_hint = upload_commands._build_upload_success_text()
 
-    assert "上传语录 [图片] [tag/@用户 ...]" in migration_hint
-    assert "记录语录 [tag/@用户 ...]" in migration_hint
-    assert "入典 [tag/@用户 ...]" in migration_hint
-    assert "记录（需回复消息）" in migration_hint
     assert success_hint.startswith("保存成功\n")
     assert "基础用法：" in success_hint
     assert "入典 [tag/@用户 ...]" in success_hint
@@ -218,7 +203,7 @@ def test_plugin_usage_text_is_updated_to_new_commands():
     usage_text = PLUGIN_INIT_PATH.read_text(encoding="utf-8")
 
     assert "`上传语录 [图片] [tag/@用户 ...]`" in usage_text
-    assert "`上传` - 迁移提示命令" in usage_text
+    assert "`上传` - 迁移提示命令" not in usage_text
     assert "`记录语录 [tag/@用户 ...]`" in usage_text
     assert "`入典 [tag/@用户 ...]`" in usage_text
     assert "`入典 [-n 数量] [-o|--only]`" in usage_text
@@ -234,7 +219,8 @@ def test_plugin_usage_text_is_updated_to_new_commands():
     assert 'key="BATCH_TEXT_RECOGNITION_PRIORITY"' in usage_text
     assert 'value="paddleocr_api"' in usage_text
     assert 'key="BATCH_UPLOAD_OCR_MODE"' not in usage_text
-    assert 'version="v1.4.0"' in usage_text
+    assert 'version="v1.4.1"' in usage_text
     assert 'key="TAG_ALIAS_ADMIN_LEVEL"' in usage_text
     assert "`taglink tag1 tag2 ...`" in usage_text
+    assert "`tag别名`" in usage_text
     assert "`语录 #tag`" in usage_text

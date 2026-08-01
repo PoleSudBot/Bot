@@ -358,11 +358,15 @@ async def _build_tag_view_message(
             continue
         for group_index, members in enumerate(tag_groups):
             if group_index:
-                message.append(" ")
-            for member_index, member in enumerate(members):
-                if member_index:
-                    message.append(" = ")
-                message.extend(QuoteService.format_tags_for_message([member]))
+                message.append("；")
+            message.extend(QuoteService.format_tags_for_message([members[0]]))
+            if len(members) > 1:
+                message.append("（")
+                for member_index, member in enumerate(members[1:]):
+                    if member_index:
+                        message.append("、")
+                    message.extend(QuoteService.format_tags_for_message([member]))
+                message.append("）")
     return message or ["没有可显示的 tag。"]
 
 
@@ -594,7 +598,7 @@ quote_tagunlink_cmd = on_alconna(
 )
 quote_taggroup_cmd = on_alconna(
     Alconna("taggroup", Args["parts", MultiVar(At | Text)]),
-    aliases={"tag组", "互通组"},
+    aliases={"tag组", "tag别名", "互通组"},
     priority=4,
     block=True,
 )

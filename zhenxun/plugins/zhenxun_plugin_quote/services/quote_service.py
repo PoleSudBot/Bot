@@ -445,7 +445,7 @@ class QuoteService:
 
     @classmethod
     async def get_quote_tag_groups(cls, quote: Quote) -> list[list[str]]:
-        """按互通组折叠展示语录 tag；组内成员均平等。"""
+        """按互通组折叠展示语录 tag，并将语录实际保存的 tag 置于组首。"""
         if not cls._uses_relation_tags(quote):
             return [[tag] for tag in cls.get_all_tags(quote)]
 
@@ -469,7 +469,8 @@ class QuoteService:
                 .order_by("id")
                 .values_list("value", flat=True)
             )
-            display_groups.append(members)
+            aliases = [member for member in members if member != tag.value]
+            display_groups.append([tag.value, *aliases])
         return display_groups
 
     @classmethod

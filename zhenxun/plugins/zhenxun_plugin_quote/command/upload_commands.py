@@ -547,10 +547,6 @@ def _starts_with_command_name(text: str, command_name: str) -> bool:
     return _strip_command_start(text).startswith(command_name)
 
 
-def _is_new_upload_command_text(text: str) -> bool:
-    return _starts_with_command_name(text, "上传语录")
-
-
 def _is_new_record_command_text(text: str) -> bool:
     return _starts_with_command_name(text, "记录语录")
 
@@ -562,16 +558,6 @@ def _build_basic_usage_hint_text() -> str:
         "记录语录 [tag/@用户 ...]（记录 为别名，需回复消息）\n"
         "入典 [tag/@用户 ...]（classic 预设，需回复消息）\n"
         "语录 [关键词/@用户]"
-    )
-
-
-def _build_upload_migration_hint_text() -> str:
-    return (
-        "“上传”不再直接解析图片。\n"
-        "上传图片并解析请使用：上传语录 [图片] [tag/@用户 ...]\n"
-        "回复文本生成语录请使用：记录语录 [tag/@用户 ...]\n"
-        "classic 风格预设可使用：入典 [tag/@用户 ...]\n"
-        "兼容别名：记录（需回复消息）"
     )
 
 
@@ -630,11 +616,8 @@ async def _match_upload_with_image(event: MessageEvent) -> bool:
     )
 
 
-def upload_has_image_rule(*, exclude_new_command: bool = False) -> Rule:
+def upload_has_image_rule() -> Rule:
     async def _rule(event: MessageEvent) -> bool:
-        # 旧“上传”必须显式让出“上传语录”，否则 compact 前缀匹配会把新命令吞掉。
-        if exclude_new_command and _is_new_upload_command_text(event.get_plaintext()):
-            return False
         return await _match_upload_with_image(event)
 
     return Rule(_rule)
@@ -727,17 +710,6 @@ save_img_cmd = on_alconna(
     auto_send_output=False,
     block=True,
     rule=upload_has_image_rule(),
-)
-legacy_upload_alc = Alconna(
-    "上传",
-    Args["parts?", MultiVar(At | Text | UniImage)],
-    meta=CommandMeta(strict=False, compact=True),
-)
-upload_hint_cmd = on_alconna(
-    legacy_upload_alc,
-    auto_send_output=False,
-    block=True,
-    rule=upload_has_image_rule(exclude_new_command=True),
 )
 make_record_alc = Alconna(
     "记录语录",
@@ -950,25 +922,6 @@ def _build_batch_upload_summary(results: list[_UploadImageResult]) -> str:
             "可回复对应语录使用「tag add 标签」补充。"
         )
     return "\n".join(lines)
-
-
-@upload_hint_cmd.handle()
-async def upload_hint_handle(bot: Bot, event: MessageEvent):
-    """旧上传命令只负责提示迁移，不再触发 OCR 或保存。"""
-    session_id = event.get_session_id()
-    if "group" not in session_id:
-        await upload_hint_cmd.finish("上传功能目前仅支持群聊。")
-        return
-
-    group_id = session_id.split("_")[1]
-    await bot.call_api(
-        "send_group_msg",
-        **{
-            "group_id": int(group_id),
-            "message": MessageSegment.reply(event.message_id)
-            + _build_upload_migration_hint_text(),
-        },
-    )
 
 
 @save_img_cmd.handle()
