@@ -9,6 +9,9 @@ from tortoise import Tortoise
 nonebot.init()
 
 from zhenxun.models.user_console import UserConsole
+from zhenxun.models.user_gold_log import UserGoldLog
+from zhenxun.utils.enum import GoldHandle
+from zhenxun.utils.exception import InsufficientGold
 
 
 @pytest.fixture
@@ -87,3 +90,127 @@ async def test_uid_collision_refreshes_and_retries(monkeypatch, user_console_db)
     assert created is True
     assert user.uid == 2
     assert allocation_count == 2
+
+
+@pytest.mark.asyncio
+async def test_add_and_reduce_gold_validate_amounts_and_write_logs(user_console_db):
+    user = await UserConsole.get_user("wallet_user", "qq")
+    user.gold = 100
+    await user.save(update_fields=["gold"])
+
+    await UserConsole.add_gold("wallet_user", 20, "test:add", "qq")
+    await UserConsole.reduce_gold(
+        "wallet_user", 30, GoldHandle.PLUGIN, "test:reduce", "qq"
+    )
+
+    await user.refresh_from_db()
+    logs = await UserGoldLog.filter(user_id="wallet_user").order_by("id")
+    assert user.gold == 90
+    assert [(log.gold, log.handle, log.source) for log in logs] == [
+        (20, GoldHandle.GET, "test:add"),
+        (30, GoldHandle.PLUGIN, "test:reduce"),
+    ]
+    for invalid in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="增加金币数量必须为正整数"):
+            await UserConsole.add_gold("wallet_user", invalid, "invalid", "qq")
+        with pytest.raises(ValueError, match="扣除金币数量必须为正整数"):
+            await UserConsole.reduce_gold(
+                "wallet_user", invalid, GoldHandle.PLUGIN, "invalid", "qq"
+            )
+
+
+@pytest.mark.asyncio
+async def test_reduce_gold_is_atomic_under_contention(user_console_db):
+    user = await UserConsole.get_user("spender", "qq")
+    user.gold = 100
+    await user.save(update_fields=["gold"])
+
+    results = await asyncio.gather(
+        *(
+            UserConsole.reduce_gold(
+                "spender", 30, GoldHandle.PLUGIN, f"charge:{index}", "qq"
+            )
+            for index in range(4)
+        ),
+        return_exceptions=True,
+    )
+
+    await user.refresh_from_db()
+    assert user.gold == 10
+    assert sum(result is None for result in results) == 3
+    assert sum(isinstance(result, InsufficientGold) for result in results) == 1
+    assert await UserGoldLog.filter(user_id="spender").count() == 3
+
+
+@pytest.mark.asyncio
+async def test_gold_log_failure_rolls_back_balance(monkeypatch, user_console_db):
+    user = await UserConsole.get_user("rollback", "qq")
+    user.gold = 100
+    await user.save(update_fields=["gold"])
+
+    async def fail_create(*_args, **_kwargs):
+        raise RuntimeError("log failure")
+
+    monkeypatch.setattr(UserGoldLog, "create", fail_create)
+
+    with pytest.raises(RuntimeError, match="log failure"):
+        await UserConsole.add_gold("rollback", 20, "test", "qq")
+    await user.refresh_from_db()
+    assert user.gold == 100
+
+    with pytest.raises(RuntimeError, match="log failure"):
+        await UserConsole.reduce_gold(
+            "rollback", 20, GoldHandle.PLUGIN, "test", "qq"
+        )
+    await user.refresh_from_db()
+    assert user.gold == 100
+
+
+@pytest.mark.asyncio
+async def test_transfer_log_failure_rolls_back_both_balances(
+    monkeypatch, user_console_db
+):
+    sender = await UserConsole.get_user("sender", "qq")
+    receiver = await UserConsole.get_user("receiver", "qq")
+    sender.gold = 150
+    receiver.gold = 20
+    await UserConsole.bulk_update([sender, receiver], ["gold"])
+
+    async def fail_create(*_args, **_kwargs):
+        raise RuntimeError("log failure")
+
+    monkeypatch.setattr(UserGoldLog, "create", fail_create)
+
+    with pytest.raises(RuntimeError, match="log failure"):
+        await UserConsole.transfer_gold("sender", "receiver", 30, "qq")
+
+    await sender.refresh_from_db()
+    await receiver.refresh_from_db()
+    assert sender.gold == 150
+    assert receiver.gold == 20
+    assert await UserGoldLog.all().count() == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_gold_adjustments_allow_negative_balances(user_console_db):
+    user = await UserConsole.get_user("managed", "qq")
+
+    assert await UserConsole.set_gold(
+        "managed", -50, "superuser:set:operator", "qq"
+    ) == (100, -50)
+    assert await UserConsole.adjust_gold(
+        "managed", -25, "superuser:adjust:operator", "qq"
+    ) == (-50, -75)
+    assert await UserConsole.set_gold(
+        "managed", -75, "superuser:set:operator", "qq"
+    ) == (-75, -75)
+
+    await user.refresh_from_db()
+    logs = await UserGoldLog.filter(user_id="managed").order_by("id")
+    assert user.gold == -75
+    assert [(log.gold, log.handle, log.source) for log in logs] == [
+        (-150, GoldHandle.ADJUST, "superuser:set:operator"),
+        (-25, GoldHandle.ADJUST, "superuser:adjust:operator"),
+    ]
+    with pytest.raises(ValueError, match="金币调整数量不能为 0"):
+        await UserConsole.adjust_gold("managed", 0, "superuser:adjust:operator", "qq")

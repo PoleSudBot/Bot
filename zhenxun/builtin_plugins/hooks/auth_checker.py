@@ -49,7 +49,7 @@ from .auth.exception import (
     PermissionExemption,
     SkipPluginException,
 )
-from .auth.utils import is_poke
+from .auth.utils import is_poke, send_message
 
 AUTH_HOOKS_CONCURRENCY_LIMIT = 5
 AUTH_DB_CONCURRENCY_LIMIT = 6
@@ -1098,7 +1098,18 @@ async def get_plugin_cost(
     返回:
         int: 调用插件金币费用
     """
-    cost_gold = await with_timeout(auth_cost(user, plugin, session), name="auth_cost")
+    try:
+        cost_gold = await with_timeout(
+            auth_cost(user, plugin, session), name="auth_cost"
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"获取插件费用超时，模块: {plugin.module}",
+            LOGGER_COMMAND,
+            session=session,
+        )
+        await send_message(session, "金币费用查询超时，本次功能未执行，请稍后重试。")
+        raise IgnoredException("gold cost timeout") from None
     if session.user.id in bot.config.superusers:
         if plugin.plugin_type == PluginType.SUPERUSER:
             raise IsSuperuserException()
@@ -1129,15 +1140,16 @@ async def reduce_gold(user_id: str, module: str, cost_gold: int, session: Uninfo
             name="reduce_gold",
         )
     except InsufficientGold:
-        if u := await UserConsole.get_user(user_id):
-            u.gold = 0
-            await u.save(update_fields=["gold"])
+        await send_message(session, "金币余额不足，本次功能未执行。")
+        raise IgnoredException("insufficient gold during charge") from None
     except asyncio.TimeoutError:
         logger.error(
             f"扣除金币超时，用户: {user_id}, 金币: {cost_gold}",
             LOGGER_COMMAND,
             session=session,
         )
+        await send_message(session, "金币扣除超时，本次功能未执行，请稍后重试。")
+        raise IgnoredException("gold charge timeout") from None
 
     # 清除缓存，使下次查询时从数据库获取最新数据
     await user_dao.clear_cache(user_id=user_id)
@@ -1486,16 +1498,8 @@ async def auth(
         # 获取插件费用
         if not route_skip_checks and plugin.cost_gold > 0:
             cost_start = time.time()
-            try:
-                cost_gold = await with_timeout(
-                    get_plugin_cost(bot, user, plugin, session), name="get_plugin_cost"
-                )
-                hook_recorder.set("cost_gold", f"{time.time() - cost_start:.3f}s")
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"获取插件费用超时，模块: {module}", LOGGER_COMMAND, session=session
-                )
-                # 继续执行，不阻止权限检查
+            cost_gold = await get_plugin_cost(bot, user, plugin, session)
+            hook_recorder.set("cost_gold", f"{time.time() - cost_start:.3f}s")
         else:
             hook_recorder.set("cost_gold", "skipped")
 
@@ -1674,16 +1678,8 @@ async def auth(
     # 扣除金币
     if not ignore_flag and cost_gold > 0:
         gold_start = time.time()
-        try:
-            await with_timeout(
-                reduce_gold(entity.user_id, module, cost_gold, session),
-                name="reduce_gold",
-            )
-            hook_recorder.set("reduce_gold", f"{time.time() - gold_start:.3f}s")
-        except asyncio.TimeoutError:
-            logger.error(
-                f"扣除金币超时，模块: {module}", LOGGER_COMMAND, session=session
-            )
+        await reduce_gold(entity.user_id, module, cost_gold, session)
+        hook_recorder.set("reduce_gold", f"{time.time() - gold_start:.3f}s")
 
     # 记录总执行时间
     total_time = time.time() - start_time

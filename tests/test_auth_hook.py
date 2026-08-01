@@ -11,6 +11,7 @@ import pytest
 nonebot.init()
 
 auth_hook = importlib.import_module("zhenxun.builtin_plugins.hooks.auth_hook")
+auth_checker = importlib.import_module("zhenxun.builtin_plugins.hooks.auth_checker")
 auth_cost_mod = importlib.import_module(
     "zhenxun.builtin_plugins.hooks.auth.auth_cost"
 )
@@ -24,6 +25,9 @@ auth_exception_mod = importlib.import_module(
 init_plugin = importlib.import_module("zhenxun.builtin_plugins.init")
 EventSession = importlib.import_module("nonebot_plugin_session").EventSession
 PluginType = importlib.import_module("zhenxun.utils.enum").PluginType
+InsufficientGold = importlib.import_module(
+    "zhenxun.utils.exception"
+).InsufficientGold
 
 
 class _FakeEvent:
@@ -275,6 +279,53 @@ async def test_auth_cost_appends_sign_in_hint_to_existing_message(monkeypatch):
         await auth_cost_mod.auth_cost(user, plugin, _make_session())
 
     assert sent_messages == ["金币不足..该功能需要100金币（也许..可以试试签到？）"]
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_cost_timeout_stops_paid_feature(monkeypatch):
+    sent_messages: list[str] = []
+
+    async def _fake_with_timeout(coro, **_kwargs):
+        coro.close()
+        raise TimeoutError
+
+    async def _fake_send_message(_session, message, *_args, **_kwargs):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(auth_checker, "with_timeout", _fake_with_timeout)
+    monkeypatch.setattr(auth_checker, "send_message", _fake_send_message)
+    plugin = SimpleNamespace(module="paid_demo", plugin_type=PluginType.NORMAL)
+
+    with pytest.raises(IgnoredException, match="gold cost timeout"):
+        await auth_checker.get_plugin_cost(
+            _make_bot(), SimpleNamespace(gold=100), plugin, _make_session()
+        )
+
+    assert sent_messages == ["金币费用查询超时，本次功能未执行，请稍后重试。"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [InsufficientGold(), TimeoutError()])
+async def test_reduce_gold_failure_stops_paid_feature(monkeypatch, failure):
+    sent_messages: list[str] = []
+
+    async def _fake_reduce_gold(*_args, **_kwargs):
+        raise failure
+
+    async def _fake_send_message(_session, message, *_args, **_kwargs):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(auth_checker.UserConsole, "reduce_gold", _fake_reduce_gold)
+    monkeypatch.setattr(auth_checker, "send_message", _fake_send_message)
+    monkeypatch.setattr(
+        auth_checker.PlatformUtils, "get_platform", lambda _session: "qq"
+    )
+
+    with pytest.raises(IgnoredException):
+        await auth_checker.reduce_gold("123", "paid_demo", 20, _make_session())
+
+    assert len(sent_messages) == 1
+    assert "本次功能未执行" in sent_messages[0]
 
 
 @pytest.mark.asyncio

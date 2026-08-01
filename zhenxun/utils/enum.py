@@ -101,6 +101,8 @@ class GoldHandle(StrEnum):
     """转出"""
     TRANSFER_IN = "TRANSFER_IN"
     """转入"""
+    ADJUST = "ADJUST"
+    """管理员调整"""
 
 
 class PropHandle(StrEnum):

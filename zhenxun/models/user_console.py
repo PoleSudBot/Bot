@@ -3,6 +3,7 @@ from typing import ClassVar
 
 from tortoise import fields
 from tortoise.exceptions import IntegrityError
+from tortoise.expressions import F
 from tortoise.transactions import in_transaction
 
 from zhenxun.services.db_context import Model
@@ -42,6 +43,11 @@ class UserConsole(Model):
 
     _uid_counter: ClassVar[int | None] = None
     _uid_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+
+    @staticmethod
+    def _validate_integer(value: int, message: str) -> None:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(message)
 
     @classmethod
     async def get_or_create_user(
@@ -108,12 +114,23 @@ class UserConsole(Model):
             source: 来源
             platform: 平台.
         """
-        user, _ = await cls.get_or_create_user(user_id=user_id, platform=platform)
-        user.gold += gold
-        await user.save(update_fields=["gold"])
-        await UserGoldLog.create(
-            user_id=user_id, gold=gold, handle=GoldHandle.GET, source=source
-        )
+        cls._validate_integer(gold, "增加金币数量必须为正整数")
+        if gold <= 0:
+            raise ValueError("增加金币数量必须为正整数")
+        await cls.get_or_create_user(user_id=user_id, platform=platform)
+        async with in_transaction() as connection:
+            updated = await cls.filter(user_id=user_id).using_db(connection).update(
+                gold=F("gold") + gold
+            )
+            if not updated:
+                raise RuntimeError(f"金币账户不存在: {user_id}")
+            await UserGoldLog.create(
+                using_db=connection,
+                user_id=user_id,
+                gold=gold,
+                handle=GoldHandle.GET,
+                source=source,
+            )
 
     @classmethod
     async def reduce_gold(
@@ -136,14 +153,90 @@ class UserConsole(Model):
         异常:
             InsufficientGold: 金币不足
         """
-        user, _ = await cls.get_or_create_user(user_id=user_id, platform=platform)
-        if user.gold < gold:
-            raise InsufficientGold()
-        user.gold -= gold
-        await user.save(update_fields=["gold"])
-        await UserGoldLog.create(
-            user_id=user_id, gold=gold, handle=handle, source=plugin_module
-        )
+        cls._validate_integer(gold, "扣除金币数量必须为正整数")
+        if gold <= 0:
+            raise ValueError("扣除金币数量必须为正整数")
+        await cls.get_or_create_user(user_id=user_id, platform=platform)
+        async with in_transaction() as connection:
+            updated = (
+                await cls.filter(user_id=user_id, gold__gte=gold)
+                .using_db(connection)
+                .update(gold=F("gold") - gold)
+            )
+            if not updated:
+                raise InsufficientGold()
+            await UserGoldLog.create(
+                using_db=connection,
+                user_id=user_id,
+                gold=gold,
+                handle=handle,
+                source=plugin_module,
+            )
+
+    @classmethod
+    async def set_gold(
+        cls,
+        user_id: str,
+        balance: int,
+        source: str,
+        platform: str | None = None,
+    ) -> tuple[int, int]:
+        """设置金币余额并记录调整流水。"""
+        cls._validate_integer(balance, "金币余额必须为整数")
+        await cls.get_or_create_user(user_id=user_id, platform=platform)
+        async with in_transaction() as connection:
+            user = (
+                await cls.filter(user_id=user_id)
+                .using_db(connection)
+                .select_for_update()
+                .get()
+            )
+            old_balance = user.gold
+            if old_balance == balance:
+                return old_balance, balance
+            user.gold = balance
+            await user.save(using_db=connection, update_fields=["gold"])
+            await UserGoldLog.create(
+                using_db=connection,
+                user_id=user_id,
+                gold=balance - old_balance,
+                handle=GoldHandle.ADJUST,
+                source=source,
+            )
+            return old_balance, balance
+
+    @classmethod
+    async def adjust_gold(
+        cls,
+        user_id: str,
+        delta: int,
+        source: str,
+        platform: str | None = None,
+    ) -> tuple[int, int]:
+        """按差额调整金币余额并记录流水。"""
+        cls._validate_integer(delta, "金币调整数量必须为整数")
+        if delta == 0:
+            raise ValueError("金币调整数量不能为 0")
+        await cls.get_or_create_user(user_id=user_id, platform=platform)
+        async with in_transaction() as connection:
+            user = (
+                await cls.filter(user_id=user_id)
+                .using_db(connection)
+                .select_for_update()
+                .get()
+            )
+            old_balance = user.gold
+            new_balance = old_balance + delta
+            user.gold = new_balance
+            await user.save(using_db=connection, update_fields=["gold"])
+            await UserGoldLog.create(
+                using_db=connection,
+                user_id=user_id,
+                gold=delta,
+                handle=GoldHandle.ADJUST,
+                source=source,
+            )
+            return old_balance, new_balance
 
     @classmethod
     async def transfer_gold(
@@ -165,6 +258,7 @@ class UserConsole(Model):
             ValueError: 金币数量非法或转账双方相同
             InsufficientGold: 金币不足
         """
+        cls._validate_integer(gold, "转账金额必须为正整数")
         if gold <= 0:
             raise ValueError("转账金额必须为正整数")
         if from_user_id == to_user_id:
