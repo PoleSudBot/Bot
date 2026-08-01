@@ -60,6 +60,7 @@ __plugin_meta__ = PluginMetadata(
     usage=(
         "### 核心功能\n"
         "`语录 [关键词/@用户] [-n 数量]` - 随机发送语录，可按关键词或用户筛选，默认 1 张，最多 10 张\n"
+        "群聊中戳一戳 Bot - 随机发送一条本群语录；没有可用语录时静默跳过\n"
         "`语录 [关键词/@用户] -序号` - 按入库倒序发送指定语录，"
         "例如 `语录 -1` 为最新一条\n"
         "示例：`语录`、`语录 南极`、`语录南极`、`语录 @南极`、"
@@ -119,7 +120,7 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="v1.4.2",
+        version="v1.4.3",
         admin_level=0,
         configs=[
             RegisterConfig(

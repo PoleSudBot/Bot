@@ -4,8 +4,10 @@ import re
 
 import aiofiles
 from arclet.alconna import Alconna, Args, Arparma, MultiVar, Option, Subcommand
-from nonebot.adapters.onebot.v11 import Bot, Event
+from nonebot import on_notice
+from nonebot.adapters.onebot.v11 import Bot, Event, PokeNotifyEvent
 from nonebot.exception import ActionFailed, AdapterException
+from nonebot.rule import Rule, to_me
 from nonebot.typing import T_State
 from nonebot_plugin_alconna import At, on_alconna
 from nonebot_plugin_alconna.uniseg import Image, UniMessage
@@ -13,6 +15,7 @@ from nonebot_plugin_alconna.uniseg import Image, UniMessage
 from zhenxun.services.log import logger
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.rules import notice_rule
 
 from ..config import (
     safe_file_exists,
@@ -85,6 +88,17 @@ stats_alc = Alconna(
 )
 quote_stats_cmd = on_alconna(stats_alc, priority=5, block=True)
 quote_stats_cmd.shortcut("语录统计", {"args": ["stats"]})
+
+
+def _is_group_poke(event: PokeNotifyEvent) -> bool:
+    return event.group_id is not None
+
+
+quote_poke = on_notice(
+    priority=5,
+    block=False,
+    rule=notice_rule(PokeNotifyEvent) & to_me() & Rule(_is_group_poke),
+)
 
 
 def _normalize_quote_count(count: int | None) -> int:
@@ -344,15 +358,18 @@ async def _send_quote_batch(
     target,
     group_id: str,
     quotes: list[Quote],
+    *,
+    silent_on_unavailable: bool = False,
 ) -> list[Quote]:
     # 发送前再次过滤可用文件，缩小存在性检查与实际读取之间的竞态窗口。
     available_quotes = [
         quote for quote in quotes if safe_file_exists(quote.image_path)
     ]
     if not available_quotes:
-        await MessageUtils.build_message(
-            "语录记录存在，但图片暂时不可用，请联系管理员检查。"
-        ).send(target=target, bot=bot)
+        if not silent_on_unavailable:
+            await MessageUtils.build_message(
+                "语录记录存在，但图片暂时不可用，请联系管理员检查。"
+            ).send(target=target, bot=bot)
         return []
 
     # 所有发送模式先逐图读取，确保单张在复查后失效时仍能发送其余图片。
@@ -375,9 +392,10 @@ async def _send_quote_batch(
         sent_quotes.append(quote)
 
     if not image_payloads:
-        await MessageUtils.build_message(
-            "语录记录存在，但图片暂时不可用，请联系管理员检查。"
-        ).send(target=target, bot=bot)
+        if not silent_on_unavailable:
+            await MessageUtils.build_message(
+                "语录记录存在，但图片暂时不可用，请联系管理员检查。"
+            ).send(target=target, bot=bot)
         return []
 
     if len(sent_quotes) <= 5:
@@ -584,6 +602,33 @@ async def record_pool_handle(bot: Bot, event: Event, arp: Arparma, state: T_Stat
     if memory_key:
         QuoteService.record_recent_quote_ids(memory_key, [quote.id for quote in quotes])
     await QuoteService.increment_view_counts([quote.id for quote in quotes])
+
+
+@quote_poke.handle()
+async def handle_quote_poke(bot: Bot, event: PokeNotifyEvent):
+    group_id = event.group_id
+    if group_id is None:
+        return
+
+    group_id_str = str(group_id)
+    target = PlatformUtils.get_target(group_id=group_id_str)
+    quotes, memory_key, _ = await _get_valid_random_quotes(group_id_str, 1)
+    if not quotes:
+        return
+
+    sent_quotes = await _send_quote_batch(
+        bot,
+        target,
+        group_id_str,
+        quotes,
+        silent_on_unavailable=True,
+    )
+    if not sent_quotes:
+        return
+
+    quote_ids = [quote.id for quote in sent_quotes]
+    QuoteService.record_recent_quote_ids(memory_key, quote_ids)
+    await QuoteService.increment_view_counts(quote_ids)
 
 
 @quote_stats_cmd.handle()

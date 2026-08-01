@@ -680,6 +680,33 @@ async def test_send_quote_batch_rechecks_files_before_sending(
 
 
 @pytest.mark.asyncio
+async def test_send_quote_batch_can_silence_unavailable_files(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    quote = SimpleNamespace(id=34, group_id="123", image_path="missing.png")
+
+    def _fail_build_message(payload):
+        raise AssertionError("静默模式不应发送图片不可用提示")
+
+    monkeypatch.setattr(query_commands, "safe_file_exists", lambda path: False)
+    monkeypatch.setattr(
+        query_commands.MessageUtils,
+        "build_message",
+        _fail_build_message,
+    )
+
+    sent_quotes = await query_commands._send_quote_batch(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "123",
+        [quote],
+        silent_on_unavailable=True,
+    )
+
+    assert sent_quotes == []
+
+
+@pytest.mark.asyncio
 async def test_send_small_quote_batch_skips_file_lost_after_recheck(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3451,6 +3478,121 @@ async def test_private_quote_query_sends_group_only_guidance(
     )
 
     assert sent_messages == ["请在群聊中使用语录查询。"]
+
+
+@pytest.mark.asyncio
+async def test_group_poke_sends_one_quote_and_records_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    quote = SimpleNamespace(id=7)
+    target = SimpleNamespace()
+    lookup_calls: list[tuple[str, int]] = []
+    send_calls: list[tuple[object, object, str, list[object], bool]] = []
+    recent_calls: list[tuple[str, list[int]]] = []
+    view_calls: list[list[int]] = []
+
+    async def _fake_get_valid_random_quotes(group_id, target_count):
+        lookup_calls.append((group_id, target_count))
+        return [quote], "123_all", True
+
+    async def _fake_send_quote_batch(
+        bot,
+        reply_target,
+        group_id,
+        quotes,
+        *,
+        silent_on_unavailable=False,
+    ):
+        send_calls.append(
+            (bot, reply_target, group_id, quotes, silent_on_unavailable)
+        )
+        return quotes
+
+    async def _fake_increment_view_counts(quote_ids):
+        view_calls.append(quote_ids)
+
+    monkeypatch.setattr(
+        query_commands.PlatformUtils,
+        "get_target",
+        lambda **kwargs: target,
+    )
+    monkeypatch.setattr(
+        query_commands,
+        "_get_valid_random_quotes",
+        _fake_get_valid_random_quotes,
+    )
+    monkeypatch.setattr(
+        query_commands,
+        "_send_quote_batch",
+        _fake_send_quote_batch,
+    )
+    monkeypatch.setattr(
+        QuoteService,
+        "record_recent_quote_ids",
+        lambda memory_key, quote_ids: recent_calls.append((memory_key, quote_ids)),
+    )
+    monkeypatch.setattr(
+        QuoteService,
+        "increment_view_counts",
+        _fake_increment_view_counts,
+    )
+    bot = SimpleNamespace()
+    event = SimpleNamespace(group_id=123)
+
+    await query_commands.handle_quote_poke(bot, event)
+
+    assert lookup_calls == [("123", 1)]
+    assert send_calls == [(bot, target, "123", [quote], True)]
+    assert recent_calls == [("123_all", [7])]
+    assert view_calls == [[7]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_candidates", [False, True])
+async def test_group_poke_without_sendable_quote_is_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    has_candidates: bool,
+):
+    async def _fake_get_valid_random_quotes(group_id, target_count):
+        assert (group_id, target_count) == ("123", 1)
+        return [], "123_all", has_candidates
+
+    async def _fail(*args, **kwargs):
+        raise AssertionError("没有可发送语录时不应继续发送或计数")
+
+    monkeypatch.setattr(
+        query_commands.PlatformUtils,
+        "get_target",
+        lambda **kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        query_commands,
+        "_get_valid_random_quotes",
+        _fake_get_valid_random_quotes,
+    )
+    monkeypatch.setattr(query_commands, "_send_quote_batch", _fail)
+    monkeypatch.setattr(QuoteService, "record_recent_quote_ids", _fail)
+    monkeypatch.setattr(QuoteService, "increment_view_counts", _fail)
+
+    await query_commands.handle_quote_poke(
+        SimpleNamespace(),
+        SimpleNamespace(group_id=123),
+    )
+
+
+@pytest.mark.asyncio
+async def test_private_poke_is_silent(monkeypatch: pytest.MonkeyPatch):
+    async def _fail(*args, **kwargs):
+        raise AssertionError("私聊戳一戳不应查询或发送语录")
+
+    monkeypatch.setattr(query_commands.PlatformUtils, "get_target", _fail)
+    monkeypatch.setattr(query_commands, "_get_valid_random_quotes", _fail)
+    monkeypatch.setattr(query_commands, "_send_quote_batch", _fail)
+
+    await query_commands.handle_quote_poke(
+        SimpleNamespace(),
+        SimpleNamespace(group_id=None),
+    )
 
 
 @pytest.mark.asyncio
