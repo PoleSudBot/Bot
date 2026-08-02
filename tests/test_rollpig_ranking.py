@@ -11,6 +11,10 @@ import types
 import uuid
 
 from PIL import Image
+from nonebot.adapters.onebot.v11 import (
+    Message as OneBotMessage,
+    MessageSegment as OneBotMessageSegment,
+)
 import pytest
 
 ROLLPIG_PLUGIN_DIR = (
@@ -35,13 +39,17 @@ VALID_PNG_BYTES = base64.b64decode(
 
 
 class FakeLogger:
+    def __init__(self):
+        self.warning_messages: list[str] = []
+
     def debug(self, *_args, **_kwargs):
         return None
 
     def info(self, *_args, **_kwargs):
         return None
 
-    def warning(self, *_args, **_kwargs):
+    def warning(self, message, *_args, **_kwargs):
+        self.warning_messages.append(str(message))
         return None
 
     def error(self, *_args, **_kwargs):
@@ -1764,6 +1772,15 @@ def build_roast_event(*, plaintext: str = "烤群友"):
     )
 
 
+class FakeRoastBot:
+    async def call_api(self, api: str, **_kwargs):
+        assert api == "get_group_member_list"
+        return [{"user_id": 20002}]
+
+    async def get_group_member_info(self, **_kwargs):
+        return {"card": "目标", "nickname": "目标"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("matcher_name", "plaintext"),
@@ -1915,6 +1932,169 @@ async def test_missing_attacker_resource_is_not_treated_as_unrolled(monkeypatch)
         "请 At 或回复你要烤的群友！"
     ]
     assert fake_store.mark_calls == []
+
+
+@pytest.mark.asyncio
+async def test_today_missing_saved_pig_resource_does_not_fallback(monkeypatch):
+    class FakeStore:
+        async def get_daily_roll(self, _user_id: str):
+            return "missing-pig"
+
+        def __getattr__(self, name: str):
+            raise AssertionError(f"资源缺失后不应调用 store.{name}")
+
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=FakeStore(),
+        fake_data_manager=object(),
+        group_members=[],
+    )
+    event = types.SimpleNamespace(user_id="10001", message_id=30001)
+
+    with pytest.raises(FakeMatcherFinished):
+        await module.cmd_today.callback(event)
+
+    assert module.cmd_today.finished_messages == ["猪圈塌房了（数据缺失）"]
+    assert module.logger.warning_messages == [
+        "RollPig 今日形态资源缺失: user=10001 pig_id=missing-pig"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_pig_id", "protected"),
+    [
+        ("missing-pig", False),
+        ("pig", True),
+        ("human", False),
+        ("eaten", False),
+        ("sold-out", False),
+        ("cake-pig", False),
+    ],
+)
+async def test_random_roast_invalid_target_does_not_consume_charge(
+    monkeypatch,
+    target_pig_id,
+    protected,
+):
+    class FakeStore:
+        def __init__(self):
+            self.consume_calls = 0
+
+        async def get_daily_roll(self, user_id: str):
+            return "pig" if user_id == "10001" else target_pig_id
+
+        async def mark_group_roll_seen(self, *_args):
+            return None
+
+        async def get_daily_rolls(self, _date: str):
+            return {"20002": target_pig_id}
+
+        async def get_group_rolls(self, *_args):
+            return {}
+
+        async def is_protected(self, _group_id: str, _user_id: str):
+            return protected
+
+        async def consume_roast_cooldown(self, *_args, **_kwargs):
+            self.consume_calls += 1
+            raise AssertionError("无效随机目标不应消耗烧烤充能")
+
+    fake_store = FakeStore()
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=fake_store,
+        fake_data_manager=object(),
+        group_members=[],
+    )
+
+    with pytest.raises(FakeMatcherFinished):
+        await module.cmd_random_roast.callback(FakeRoastBot(), build_roast_event())
+
+    assert fake_store.consume_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_random_roast_valid_target_consumes_charge_once(monkeypatch, allowed):
+    class FakeStore:
+        def __init__(self):
+            self.consume_calls = 0
+            self.events: list[object] = []
+
+        async def get_daily_roll(self, _user_id: str):
+            return "pig"
+
+        async def mark_group_roll_seen(self, *_args):
+            return None
+
+        async def get_daily_rolls(self, _date: str):
+            return {"20002": "pig"}
+
+        async def get_group_rolls(self, *_args):
+            return {}
+
+        async def is_protected(self, _group_id: str, _user_id: str):
+            return False
+
+        async def consume_roast_cooldown(self, *_args, **_kwargs):
+            self.consume_calls += 1
+            return FakeCooldownConsumeResult(
+                allowed=allowed,
+                remaining_seconds=60,
+            )
+
+        async def append_roast_event(self, event):
+            self.events.append(event)
+
+    fake_store = FakeStore()
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=fake_store,
+        fake_data_manager=object(),
+        group_members=[],
+    )
+    monkeypatch.setattr(module.random, "randint", lambda *_args: 80)
+    monkeypatch.setattr(
+        module,
+        "RoastEvent",
+        lambda **kwargs: types.SimpleNamespace(**kwargs),
+    )
+
+    with pytest.raises(FakeMatcherFinished):
+        await module.cmd_random_roast.callback(FakeRoastBot(), build_roast_event())
+
+    assert fake_store.consume_calls == 1
+    assert len(fake_store.events) == int(allowed)
+
+
+@pytest.mark.parametrize(
+    ("title", "fallback"),
+    [
+        ("[CQ:at,qq=123]", "随机小猪"),
+        ("[CQ:image,file=x]", "未命名小猪"),
+        ("", "未命名小猪"),
+    ],
+)
+def test_pighub_title_is_always_plain_text(monkeypatch, title, fallback):
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=object(),
+        fake_data_manager=object(),
+        group_members=[],
+    )
+    monkeypatch.setattr(module, "Message", OneBotMessage)
+    monkeypatch.setattr(module, "MessageSegment", OneBotMessageSegment)
+
+    message = module.build_pighub_image_message(
+        {"title": title},
+        "https://example.com/pig.png",
+        fallback,
+    )
+
+    assert [segment.type for segment in message] == ["text", "image"]
+    assert message[0].data == {"text": title or fallback}
+    assert message[1].data["file"] == "https://example.com/pig.png"
 
 
 def test_cloud_store_sends_charge_max_payload():

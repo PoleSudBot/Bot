@@ -135,7 +135,7 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
     extra={
         "author": "Felis2026",
-        "version": "0.7.2",
+        "version": "0.7.3",
         "configs": [
             {
                 "module": MODULE_NAME,
@@ -1213,6 +1213,16 @@ def build_pighub_image_url(pig_item: dict) -> Optional[str]:
         )
     )
 
+
+def build_pighub_image_message(
+    pig_item: dict,
+    image_url: str,
+    fallback_title: str,
+) -> Message:
+    title = str(pig_item.get("title") or fallback_title)
+    return MessageSegment.text(title) + MessageSegment.image(image_url)
+
+
 # ================= 辅助渲染函数 =================
 async def build_panel_picture(
     *,
@@ -1460,6 +1470,11 @@ async def _(event: Event):
     extra_text = ""
     is_new = False
 
+    if pig_id and not pig:
+        logger.warning(f"RollPig 今日形态资源缺失: user={user_id} pig_id={pig_id}")
+        await cmd_today.finish("猪圈塌房了（数据缺失）")
+        return
+
     if not pig:
         if not PIG_LIST:
             await cmd_today.finish("猪圈塌房了（数据缺失）")
@@ -1530,7 +1545,7 @@ async def _(bot: Bot, event: Event, args: Message = CommandArg()):
             "data": {
                 "name": "随机小猪Bot",
                 "uin": event.self_id,
-                "content": Message(pig.get("title", "随机小猪")) + MessageSegment.image(url),
+                "content": build_pighub_image_message(pig, url, "随机小猪"),
             },
         })
 
@@ -1574,7 +1589,11 @@ async def _(bot: Bot, event: Event, args: Message = CommandArg()):
                 "data": {
                     "name": "搜猪小助手",
                     "uin": event.self_id,
-                    "content": Message(pig.get("title", "未命名小猪")) + MessageSegment.image(image_url),
+                    "content": build_pighub_image_message(
+                        pig,
+                        image_url,
+                        "未命名小猪",
+                    ),
                 },
             })
         if not messages:
@@ -1589,10 +1608,11 @@ async def _(bot: Bot, event: Event, args: Message = CommandArg()):
     if not image_url:
         await cmd_find.finish("搜索结果数据异常，请稍后再试。")
         return
-    msg = Message(pig.get("title", "未命名小猪"))
-    msg += MessageSegment.image(image_url)
+    msg = build_pighub_image_message(pig, image_url, "未命名小猪")
     if len(found_pigs) > 1:
-        msg += Message(f"\n共找到 {len(found_pigs)} 张，私聊仅展示第 1 张。")
+        msg += MessageSegment.text(
+            f"\n共找到 {len(found_pigs)} 张，私聊仅展示第 1 张。"
+        )
     await cmd_find.finish(MessageSegment.reply(event.message_id) + msg)
 
 
@@ -2095,18 +2115,6 @@ async def _(bot: Bot, event: GroupMessageEvent):
     except Exception:
         pass
 
-    # 检查攻击者 CD
-    cooldown_result = await store.consume_roast_cooldown(
-        attacker_id,
-        cooldown_seconds=resolve_roast_cooldown_seconds(),
-        max_charges=resolve_roast_charge_max(),
-    )
-    if not cooldown_result.allowed:
-        await cmd_random_roast.finish(
-            MessageSegment.reply(event.message_id) + format_cooldown_message(cooldown_result.remaining_seconds)
-        )
-        return
-
     # 读取目标形态
     target_pig = get_pig_by_id(await store.get_daily_roll(target_id))
     target_full_display = format_roast_subject_display(
@@ -2170,6 +2178,18 @@ async def _(bot: Bot, event: GroupMessageEvent):
         await cmd_random_roast.finish(
             MessageSegment.reply(event.message_id)
             + f"系统随机选中了{target_full_display}，但对方已经是熟食了，别鞭尸了。"
+        )
+        return
+
+    cooldown_result = await store.consume_roast_cooldown(
+        attacker_id,
+        cooldown_seconds=resolve_roast_cooldown_seconds(),
+        max_charges=resolve_roast_charge_max(),
+    )
+    if not cooldown_result.allowed:
+        await cmd_random_roast.finish(
+            MessageSegment.reply(event.message_id)
+            + format_cooldown_message(cooldown_result.remaining_seconds)
         )
         return
 
