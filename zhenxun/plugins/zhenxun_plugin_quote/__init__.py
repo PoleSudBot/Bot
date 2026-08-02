@@ -120,7 +120,7 @@ __plugin_meta__ = PluginMetadata(
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="v1.4.3",
+        version="v1.4.4",
         admin_level=0,
         configs=[
             RegisterConfig(

@@ -3351,6 +3351,59 @@ async def test_tag_alias_query_unlink_and_group_delete(quote_tag_database):
 
 
 @pytest.mark.asyncio
+async def test_fuzzy_tag_search_expands_alias_groups(quote_tag_database):
+    await _create_tagged_quote(1, ["xc"])
+    await _create_tagged_quote(2, ["小葱"])
+    await _create_tagged_quote(3, ["freely"])
+    await _create_tagged_quote(4, ["freestyle"])
+    await _create_tagged_quote(5, ["freeform"])
+    await _create_tagged_quote(7, ["style"])
+    await Quote.create(
+        id=6,
+        group_id="123",
+        image_path="quote/images/legacy-fuzzy-alias.png",
+        tags=["小葱"],
+        manual_tags=[],
+        tag_schema_version=0,
+    )
+    await QuoteService.link_tag_aliases("123", ["xc", "小葱", "freely"])
+    await QuoteService.link_tag_aliases("123", ["freestyle", "style"])
+
+    fuzzy_matches = await QuoteService.search_quotes("123", "free")
+    assert {quote.id for quote in fuzzy_matches} == {1, 2, 3, 4, 5, 6, 7}
+    assert await QuoteService.search_quotes("123", "free", tag_only=True) == []
+    assert {
+        quote.id
+        for quote in await QuoteService.search_quotes("123", "freely", tag_only=True)
+    } == {1, 2, 3, 6}
+
+
+@pytest.mark.asyncio
+async def test_token_fuzzy_tag_search_expands_alias_groups(
+    quote_tag_database, monkeypatch: pytest.MonkeyPatch
+):
+    first = await _create_tagged_quote(1, ["xc"])
+    second = await _create_tagged_quote(2, ["freely"])
+    unrelated = await _create_tagged_quote(3, ["freeform"])
+    first.recorded_text = "alpha"
+    second.recorded_text = "alpha"
+    unrelated.recorded_text = "beta"
+    await first.save(update_fields=["recorded_text"])
+    await second.save(update_fields=["recorded_text"])
+    await unrelated.save(update_fields=["recorded_text"])
+    await QuoteService.link_tag_aliases("123", ["xc", "freely"])
+    monkeypatch.setattr(
+        QuoteService,
+        "cut_sentence",
+        lambda text: ["alpha", "free"] if text == "alpha free" else [text],
+    )
+
+    matches = await QuoteService.search_quotes("123", "alpha free")
+
+    assert {quote.id for quote in matches} == {1, 2}
+
+
+@pytest.mark.asyncio
 async def test_linking_multiple_alias_groups_requires_confirmation(quote_tag_database):
     await QuoteService.link_tag_aliases("123", ["a", "b"])
     await QuoteService.link_tag_aliases("123", ["c", "d"])

@@ -675,6 +675,45 @@ class QuoteService:
         )
 
     @classmethod
+    async def _resolve_fuzzy_tag_candidates(
+        cls, group_id: str, value: str
+    ) -> tuple[set[int], set[str]]:
+        normalized_value = cls.normalize_tag_value(value)
+        if not normalized_value:
+            return set(), set()
+
+        matched_tags = list(
+            await QuoteTag.filter(
+                group_id=str(group_id),
+                normalized_value__contains=normalized_value,
+            )
+        )
+        if not matched_tags:
+            return set(), set()
+
+        alias_group_keys = {
+            tag.alias_group_key for tag in matched_tags if tag.alias_group_key
+        }
+        expanded_tags = matched_tags
+        if alias_group_keys:
+            expanded_tags = list(
+                await QuoteTag.filter(
+                    Q(id__in=[tag.id for tag in matched_tags])
+                    | Q(alias_group_key__in=alias_group_keys),
+                    group_id=str(group_id),
+                )
+            )
+
+        tag_ids = [tag.id for tag in expanded_tags]
+        quote_ids = set(
+            await QuoteTagLink.filter(tag_id__in=tag_ids).values_list(
+                "quote_id", flat=True
+            )
+        )
+        normalized_values = {tag.normalized_value for tag in expanded_tags}
+        return quote_ids, normalized_values
+
+    @classmethod
     async def get_quote_ids_for_user(cls, group_id: str, user_id: str) -> list[int]:
         quoted_ids = set(
             await cls.active_quotes(
@@ -1113,6 +1152,12 @@ class QuoteService:
         exact_alias_values = await cls._resolve_exact_tag_normalized_values(
             group_id, keyword
         )
+        fuzzy_tag_ids: set[int] = set()
+        fuzzy_alias_values: set[str] = set()
+        if not tag_only:
+            fuzzy_tag_ids, fuzzy_alias_values = (
+                await cls._resolve_fuzzy_tag_candidates(group_id, keyword)
+            )
 
         def legacy_exact_match(quote: Quote) -> bool:
             alias_match = any(
@@ -1120,7 +1165,12 @@ class QuoteService:
                 for tag in cls.get_all_tags(quote)
             )
             return alias_match if tag_only else (
-                alias_match or cls._check_exact_keyword_in_quote(keyword, quote)
+                alias_match
+                or any(
+                    cls.normalize_tag_value(tag) in fuzzy_alias_values
+                    for tag in cls.get_all_tags(quote)
+                )
+                or cls._check_exact_keyword_in_quote(keyword, quote)
             )
 
         legacy_quotes = [
@@ -1161,16 +1211,6 @@ class QuoteService:
             )
 
         exact_tag_ids = await cls._quote_ids_for_exact_tag(group_id, keyword)
-        fuzzy_tag_ids = (
-            set()
-            if tag_only
-            else set(
-                await QuoteTagLink.filter(
-                    tag__group_id=str(group_id),
-                    tag__normalized_value__contains=cls.normalize_tag_value(keyword),
-                ).values_list("quote_id", flat=True)
-            )
-        )
         tag_candidate_ids = exact_tag_ids | fuzzy_tag_ids
         text_candidate_ids: set[int] = set()
         if not tag_only:
@@ -1217,18 +1257,18 @@ class QuoteService:
         tokens = cls.normalize_tags([*keyword.split(), *cls.cut_sentence(keyword)])
         if not tokens:
             return []
-        token_alias_values = [
-            await cls._resolve_exact_tag_normalized_values(group_id, token)
-            for token in tokens
-        ]
+        token_alias_values: list[set[str]] = []
         token_candidate_sets: list[set[int]] = []
         for token in tokens:
             exact_token_tag_ids = await cls._quote_ids_for_exact_tag(group_id, token)
-            token_tag_ids = set(
-                await QuoteTagLink.filter(
-                    tag__group_id=str(group_id),
-                    tag__normalized_value__contains=cls.normalize_tag_value(token),
-                ).values_list("quote_id", flat=True)
+            exact_token_alias_values = await cls._resolve_exact_tag_normalized_values(
+                group_id, token
+            )
+            token_tag_ids, fuzzy_token_alias_values = (
+                await cls._resolve_fuzzy_tag_candidates(group_id, token)
+            )
+            token_alias_values.append(
+                exact_token_alias_values | fuzzy_token_alias_values
             )
             token_text_ids = set(
                 await cls.active_quotes(
