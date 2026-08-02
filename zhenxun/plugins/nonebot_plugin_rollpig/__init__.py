@@ -115,6 +115,7 @@ __plugin_meta__ = PluginMetadata(
     昨日小猪 - 查看昨天抽到了什么
     今日烤猪 - 把今天的猪做成美食（人类/熟食形态/吃掉了会拦截）
     烤群友 - 把群友做成烤猪（默认最多储存 2 次普通烧烤充能）
+      - 发起者需要先抽取今日小猪
     烤群友 + 打点后厨/偷换烤架/贿赂主厨/加急生火(兼容加急生活)
       - 每日一次强制成功（目标仍需已抽猪且非人类/熟食/吃掉了）
     烤群友 + 强行点火 - superuser 专属，无限强制成功
@@ -134,7 +135,7 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
     extra={
         "author": "Felis2026",
-        "version": "0.7.1",
+        "version": "0.7.2",
         "configs": [
             {
                 "module": MODULE_NAME,
@@ -1709,7 +1710,22 @@ async def _(bot: Bot, event: GroupMessageEvent):
     )
     group_id = str(event.group_id)
     force_mode = detect_force_roast_mode(event.get_plaintext(), attacker_id)
-    attacker_pig = get_pig_by_id(await store.get_daily_roll(attacker_id))
+
+    if force_mode == "super_denied":
+        await cmd_roast_member.finish(
+            MessageSegment.reply(event.message_id) + "口令【强行点火】仅 superuser 可用。"
+        )
+        return
+
+    attacker_pig_id = await store.get_daily_roll(attacker_id)
+    if not attacker_pig_id:
+        await cmd_roast_member.finish(
+            MessageSegment.reply(event.message_id)
+            + "你今天还没抽猪，先抽猪再来烤群友吧。"
+        )
+        return
+
+    attacker_pig = get_pig_by_id(attacker_pig_id)
     attacker_actor_display = format_roast_actor_display(attacker_name, attacker_id)
     attacker_full_display = format_roast_subject_display(
         attacker_name,
@@ -1719,12 +1735,6 @@ async def _(bot: Bot, event: GroupMessageEvent):
 
     if attacker_pig:
         await store.mark_group_roll_seen(attacker_id, attacker_pig["id"], group_id)
-
-    if force_mode == "super_denied":
-        await cmd_roast_member.finish(
-            MessageSegment.reply(event.message_id) + "口令【强行点火】仅 superuser 可用。"
-        )
-        return
 
     # 提取目标 ID 和名字
     target_id = None
@@ -2044,7 +2054,15 @@ async def _(bot: Bot, event: GroupMessageEvent):
         attacker_id,
     )
     group_id = str(event.group_id)
-    attacker_pig = get_pig_by_id(await store.get_daily_roll(attacker_id))
+    attacker_pig_id = await store.get_daily_roll(attacker_id)
+    if not attacker_pig_id:
+        await cmd_random_roast.finish(
+            MessageSegment.reply(event.message_id)
+            + "你今天还没抽猪，先抽猪再来烤群友吧。"
+        )
+        return
+
+    attacker_pig = get_pig_by_id(attacker_pig_id)
     attacker_actor_display = format_roast_actor_display(attacker_name, attacker_id)
     attacker_full_display = format_roast_subject_display(
         attacker_name,

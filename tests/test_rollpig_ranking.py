@@ -51,15 +51,25 @@ class FakeLogger:
         return None
 
 
+class FakeMatcherFinished(Exception):
+    pass
+
+
 class FakeMatcher:
+    def __init__(self):
+        self.callback = None
+        self.finished_messages: list[object] = []
+
     def handle(self):
         def decorator(func):
+            self.callback = func
             return func
 
         return decorator
 
-    async def finish(self, *_args, **_kwargs):
-        return None
+    async def finish(self, message=None, *_args, **_kwargs):
+        self.finished_messages.append(message)
+        raise FakeMatcherFinished
 
     async def send(self, *_args, **_kwargs):
         return None
@@ -1738,6 +1748,173 @@ def test_roast_commands_pass_charge_max_to_cooldown():
         keyword_names = {keyword.arg for keyword in call.keywords}
         assert "cooldown_seconds" in keyword_names
         assert "max_charges" in keyword_names
+
+
+def build_roast_event(*, plaintext: str = "烤群友"):
+    return types.SimpleNamespace(
+        user_id="10001",
+        sender=types.SimpleNamespace(card="发起者", nickname="发起者"),
+        group_id=20001,
+        message_id=30001,
+        self_id=40001,
+        reply=None,
+        message=[],
+        to_me=False,
+        get_plaintext=lambda: plaintext,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("matcher_name", "plaintext"),
+    [
+        ("cmd_roast_member", "烤群友"),
+        ("cmd_roast_member", "烤群友 加急生火"),
+        ("cmd_random_roast", "随机烤群友"),
+    ],
+)
+async def test_unrolled_user_cannot_roast_group_members(
+    monkeypatch,
+    matcher_name,
+    plaintext,
+):
+    class FakeStore:
+        def __init__(self):
+            self.daily_roll_calls: list[str] = []
+
+        async def get_daily_roll(self, user_id: str):
+            self.daily_roll_calls.append(user_id)
+            return None
+
+        def __getattr__(self, name: str):
+            raise AssertionError(f"未抽猪拦截后不应调用 store.{name}")
+
+    fake_store = FakeStore()
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=fake_store,
+        fake_data_manager=object(),
+        group_members=[],
+    )
+    matcher = getattr(module, matcher_name)
+
+    with pytest.raises(FakeMatcherFinished):
+        await matcher.callback(object(), build_roast_event(plaintext=plaintext))
+
+    assert fake_store.daily_roll_calls == ["10001"]
+    assert matcher.finished_messages == [
+        "你今天还没抽猪，先抽猪再来烤群友吧。"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_super_force_permission_denial_precedes_unrolled_check(monkeypatch):
+    class FakeStore:
+        async def get_daily_roll(self, _user_id: str):
+            raise AssertionError("权限拒绝应先于未抽猪查询")
+
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=FakeStore(),
+        fake_data_manager=object(),
+        group_members=[],
+    )
+
+    with pytest.raises(FakeMatcherFinished):
+        await module.cmd_roast_member.callback(
+            object(),
+            build_roast_event(plaintext="烤群友 super"),
+        )
+
+    assert module.cmd_roast_member.finished_messages == [
+        "口令【强行点火】仅 superuser 可用。"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_super_force_cannot_bypass_unrolled_check(monkeypatch):
+    class FakeStore:
+        async def get_daily_roll(self, _user_id: str):
+            return None
+
+        def __getattr__(self, name: str):
+            raise AssertionError(f"未抽猪拦截后不应调用 store.{name}")
+
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=FakeStore(),
+        fake_data_manager=object(),
+        group_members=[],
+    )
+    monkeypatch.setattr(module, "is_superuser_user", lambda _user_id: True)
+
+    with pytest.raises(FakeMatcherFinished):
+        await module.cmd_roast_member.callback(
+            object(),
+            build_roast_event(plaintext="烤群友 super"),
+        )
+
+    assert module.cmd_roast_member.finished_messages == [
+        "你今天还没抽猪，先抽猪再来烤群友吧。"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rolled_user_continues_to_original_target_validation(monkeypatch):
+    class FakeStore:
+        def __init__(self):
+            self.mark_calls: list[tuple[str, str, str]] = []
+
+        async def get_daily_roll(self, _user_id: str):
+            return "pig"
+
+        async def mark_group_roll_seen(self, user_id: str, pig_id: str, group_id: str):
+            self.mark_calls.append((user_id, pig_id, group_id))
+
+    fake_store = FakeStore()
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=fake_store,
+        fake_data_manager=object(),
+        group_members=[],
+    )
+
+    with pytest.raises(FakeMatcherFinished):
+        await module.cmd_roast_member.callback(object(), build_roast_event())
+
+    assert module.cmd_roast_member.finished_messages == [
+        "请 At 或回复你要烤的群友！"
+    ]
+    assert fake_store.mark_calls == [("10001", "pig", "20001")]
+
+
+@pytest.mark.asyncio
+async def test_missing_attacker_resource_is_not_treated_as_unrolled(monkeypatch):
+    class FakeStore:
+        def __init__(self):
+            self.mark_calls: list[tuple[str, str, str]] = []
+
+        async def get_daily_roll(self, user_id: str):
+            return "missing-pig" if user_id == "10001" else None
+
+        async def mark_group_roll_seen(self, user_id: str, pig_id: str, group_id: str):
+            self.mark_calls.append((user_id, pig_id, group_id))
+
+    fake_store = FakeStore()
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=fake_store,
+        fake_data_manager=object(),
+        group_members=[],
+    )
+
+    with pytest.raises(FakeMatcherFinished):
+        await module.cmd_roast_member.callback(object(), build_roast_event())
+
+    assert module.cmd_roast_member.finished_messages == [
+        "请 At 或回复你要烤的群友！"
+    ]
+    assert fake_store.mark_calls == []
 
 
 def test_cloud_store_sends_charge_max_payload():
