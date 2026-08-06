@@ -135,7 +135,7 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
     extra={
         "author": "Felis2026",
-        "version": "0.7.3",
+        "version": "0.7.4",
         "configs": [
             {
                 "module": MODULE_NAME,
@@ -2652,16 +2652,28 @@ def build_daily_summary_text(summary: dict) -> str:
     return "\n".join(lines)
 
 
-@scheduler.scheduled_job("cron", hour=23, minute=45, id="rollpig_daily_summary")
+@scheduler.scheduled_job(
+    "cron",
+    hour=23,
+    minute=45,
+    timezone="Asia/Shanghai",
+    id="rollpig_daily_summary",
+)
 async def daily_summary_job():
     """每晚 23:45~23:55 推送当日猪圈日报（随机延迟 0~10 分钟防风控）。"""
+    summary_date = rollpig_date_str()
+    protect_date = (
+        datetime.date.fromisoformat(summary_date) + datetime.timedelta(days=1)
+    ).isoformat()
     delay = random.randint(0, 600)  # 0~10 分钟随机延迟
-    logger.info(f"[每日总结] 定时触发，随机延迟 {delay} 秒后推送")
+    logger.info(
+        f"[每日总结] 定时触发: date={summary_date}，随机延迟 {delay} 秒后推送"
+    )
     await asyncio.sleep(delay)
     try:
-        active_groups = await store.get_active_group_ids()
+        active_groups = await store.get_active_group_ids(summary_date)
         if not active_groups:
-            logger.info("[每日总结] 今日无活跃群，跳过推送")
+            logger.info(f"[每日总结] 无活跃群，跳过推送: date={summary_date}")
             return
 
         # ================================ 控制台开关过滤 ================================ #
@@ -2675,15 +2687,32 @@ async def daily_summary_job():
             logger.info("[每日总结] 今日没有启用 rollpig 的活跃群，跳过推送")
             return
 
-        group_summaries = {}
-        protect_date = rollpig_date_str(1)
+        group_summaries: dict[str, dict] = {}
         for group_id in enabled_active_groups:
-            summary = await build_daily_summary(store, group_id=group_id)
+            try:
+                summary = await build_daily_summary(
+                    store,
+                    date_str=summary_date,
+                    group_id=group_id,
+                )
+                protected_ids = (
+                    [summary["most_roasted_id"]]
+                    if summary.get("most_roasted_id")
+                    and summary.get("most_roasted_count", 0) >= 2
+                    else []
+                )
+                await store.replace_group_protections(
+                    group_id,
+                    protected_ids,
+                    protect_date,
+                )
+            except Exception as group_error:
+                logger.warning(
+                    "[每日总结] 群汇总或保护写入失败，已跳过: "
+                    f"date={summary_date} group={group_id} error={group_error}"
+                )
+                continue
             group_summaries[group_id] = summary
-            if summary.get("most_roasted_id") and summary.get("most_roasted_count", 0) >= 2:
-                await store.replace_group_protections(group_id, [summary["most_roasted_id"]], protect_date)
-            else:
-                await store.replace_group_protections(group_id, [], protect_date)
 
         # 清理旧事件
         await store.prune_events(days_to_keep=7)
@@ -2700,13 +2729,17 @@ async def daily_summary_job():
         # 群内玩法可以开启，但日报消息可以单独关闭。
         summary_push_groups = [
             group_id
-            for group_id in enabled_active_groups
+            for group_id in group_summaries
             if await is_daily_summary_push_enabled(group_id)
         ]
         if not summary_push_groups:
-            logger.info("[每日总结] 已完成保护名单刷新，但没有群开启日报推送")
+            logger.info(
+                "[每日总结] 已完成保护名单刷新，但没有群开启日报推送: "
+                f"date={summary_date} summaries={len(group_summaries)}"
+            )
             return
 
+        sent_count = 0
         for group_id in summary_push_groups:
             try:
                 panel_kwargs = build_daily_summary_panel(group_summaries[group_id])
@@ -2717,10 +2750,15 @@ async def daily_summary_job():
                 message = build_daily_summary_text(group_summaries[group_id])
             try:
                 await bot.send_group_msg(group_id=int(group_id), message=message)
+                sent_count += 1
             except Exception as send_error:
                 logger.warning(f"[每日总结] 推送失败: group={group_id} error={send_error}")
 
-        logger.info(f"[每日总结] 推送完成, 共 {len(summary_push_groups)} 个群")
+        logger.info(
+            "[每日总结] 推送完成: "
+            f"date={summary_date} summaries={len(group_summaries)} "
+            f"pending={len(summary_push_groups)} sent={sent_count}"
+        )
     except CloudStoreError as e:
         logger.warning(f"[每日总结] 云端账本暂时不可用，跳过本轮推送: {e}")
     except Exception as e:

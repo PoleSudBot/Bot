@@ -30,6 +30,7 @@ ROLLPIG_RANKING_PATH = ROLLPIG_PLUGIN_DIR / "ranking.py"
 ROLLPIG_RESOURCE_MANAGER_PATH = ROLLPIG_PLUGIN_DIR / "resource_manager.py"
 ROLLPIG_ROAST_MANAGER_PATH = ROLLPIG_PLUGIN_DIR / "roast_manager.py"
 ROLLPIG_RUNTIME_PATH = ROLLPIG_PLUGIN_DIR / "runtime.py"
+ROLLPIG_SUMMARY_SERVICE_PATH = ROLLPIG_PLUGIN_DIR / "summary_service.py"
 ROLLPIG_CATALOG_RENDERER_PATH = ROLLPIG_PLUGIN_DIR / "catalog_renderer.py"
 ROLLPIG_CARD_RENDERER_PATH = ROLLPIG_PLUGIN_DIR / "card_renderer.py"
 VALID_PNG_BYTES = base64.b64decode(
@@ -40,19 +41,23 @@ VALID_PNG_BYTES = base64.b64decode(
 
 class FakeLogger:
     def __init__(self):
+        self.info_messages: list[str] = []
         self.warning_messages: list[str] = []
+        self.error_messages: list[str] = []
 
     def debug(self, *_args, **_kwargs):
         return None
 
-    def info(self, *_args, **_kwargs):
+    def info(self, message, *_args, **_kwargs):
+        self.info_messages.append(str(message))
         return None
 
     def warning(self, message, *_args, **_kwargs):
         self.warning_messages.append(str(message))
         return None
 
-    def error(self, *_args, **_kwargs):
+    def error(self, message, *_args, **_kwargs):
+        self.error_messages.append(str(message))
         return None
 
     def exception(self, *_args, **_kwargs):
@@ -134,7 +139,12 @@ class FakePluginMetadata:
 
 
 class FakeScheduler:
+    def __init__(self):
+        self.jobs: list[tuple[tuple, dict]] = []
+
     def scheduled_job(self, *_args, **_kwargs):
+        self.jobs.append((_args, _kwargs))
+
         def decorator(func):
             return func
 
@@ -587,6 +597,28 @@ def load_rollpig_roast_manager_module(
     return module, roast_file
 
 
+def load_rollpig_summary_service_module(monkeypatch: pytest.MonkeyPatch):
+    package_name = f"rollpig_summary_testpkg_{uuid.uuid4().hex}"
+    fake_package = types.ModuleType(package_name)
+    fake_package.__path__ = [str(ROLLPIG_PLUGIN_DIR)]
+    fake_runtime = types.ModuleType(f"{package_name}.runtime")
+    fake_runtime.rollpig_date_str = lambda: "2099-01-01"
+    fake_store_package = types.ModuleType(f"{package_name}.store")
+    fake_store_package.__path__ = []
+    fake_store_base = types.ModuleType(f"{package_name}.store.base")
+    fake_store_base.RollpigStore = object
+
+    monkeypatch.setitem(sys.modules, package_name, fake_package)
+    monkeypatch.setitem(sys.modules, f"{package_name}.runtime", fake_runtime)
+    monkeypatch.setitem(sys.modules, f"{package_name}.store", fake_store_package)
+    monkeypatch.setitem(sys.modules, f"{package_name}.store.base", fake_store_base)
+
+    return load_module_from_path(
+        f"{package_name}.summary_service",
+        ROLLPIG_SUMMARY_SERVICE_PATH,
+    )
+
+
 def build_manifest_meta(path: str, content: bytes) -> dict:
     return {
         "path": path,
@@ -871,6 +903,293 @@ def load_rollpig_plugin_module(
     sys.modules[package_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.asyncio
+async def test_daily_summary_uses_explicit_group_date_and_event_stats(monkeypatch):
+    class FakeStore:
+        def __init__(self):
+            self.group_roll_calls: list[tuple[str, str]] = []
+            self.event_calls: list[tuple[str, str]] = []
+
+        async def get_group_rolls(self, group_id: str, date_str: str):
+            self.group_roll_calls.append((group_id, date_str))
+            return {"human-user": "human", "pig-user": "pig"}
+
+        async def get_daily_rolls(self, _date_str: str):
+            raise AssertionError("群日报不应读取全局抽猪记录")
+
+        async def list_daily_events(self, *, date_str: str, group_id: str):
+            self.event_calls.append((date_str, group_id))
+            return [
+                {
+                    "type": "success",
+                    "attacker": "attacker",
+                    "target": "target",
+                    "attacker_name": "烧烤师",
+                    "target_name": "食材",
+                },
+                {
+                    "type": "success",
+                    "attacker": "attacker",
+                    "target": "target",
+                    "attacker_name": "烧烤师",
+                    "target_name": "食材",
+                },
+                {"type": "self_roast", "attacker": "self", "target": "self"},
+                {"type": "escape", "attacker": "hunter", "target": "runner"},
+                {"type": "backfire", "attacker": "backfire", "target": "target"},
+            ]
+
+    module = load_rollpig_summary_service_module(monkeypatch)
+    fake_store = FakeStore()
+
+    summary = await module.build_daily_summary(
+        fake_store,
+        date_str="2026-04-22",
+        group_id="10001",
+    )
+
+    assert fake_store.group_roll_calls == [("10001", "2026-04-22")]
+    assert fake_store.event_calls == [("2026-04-22", "10001")]
+    assert summary == {
+        "total": 5,
+        "most_roasted_id": "target",
+        "most_roasted_name": "食材",
+        "most_roasted_count": 2,
+        "most_active_id": "attacker",
+        "most_active_name": "烧烤师",
+        "most_active_count": 2,
+        "escape_king_id": "runner",
+        "escape_king_name": "runner",
+        "escape_king_count": 1,
+        "backfire_king_id": "backfire",
+        "backfire_king_name": "backfire",
+        "backfire_king_count": 1,
+        "roll_count": 2,
+        "top_pig_id": "human",
+        "top_pig_count": 1,
+        "human_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_daily_summary_job_freezes_date_and_preserves_switch_boundaries(
+    monkeypatch,
+):
+    class FakeStore:
+        def __init__(self):
+            self.active_dates: list[str] = []
+            self.protection_calls: list[tuple[str, list[str], str]] = []
+            self.prune_calls: list[tuple[str, int]] = []
+
+        async def get_active_group_ids(self, date_str: str):
+            self.active_dates.append(date_str)
+            return {"10001", "10002", "10003"}
+
+        async def replace_group_protections(
+            self,
+            group_id: str,
+            user_ids: list[str],
+            protect_date: str,
+        ):
+            self.protection_calls.append((group_id, user_ids, protect_date))
+
+        async def prune_events(self, *, days_to_keep: int):
+            self.prune_calls.append(("events", days_to_keep))
+
+        async def prune_history(self, *, days_to_keep: int):
+            self.prune_calls.append(("history", days_to_keep))
+
+    class FakeBot:
+        def __init__(self):
+            self.sent_groups: list[int] = []
+
+        async def send_group_msg(self, *, group_id: int, message):
+            self.sent_groups.append(group_id)
+
+    fake_store = FakeStore()
+    fake_bot = FakeBot()
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=fake_store,
+        fake_data_manager=object(),
+        group_members=[],
+    )
+    current_date = "2026-04-22"
+
+    async def cross_midnight(_delay: int):
+        nonlocal current_date
+        current_date = "2026-04-23"
+
+    summary_calls: list[tuple[str, str]] = []
+
+    async def build_summary(_store, *, date_str: str, group_id: str):
+        summary_calls.append((date_str, group_id))
+        return {
+            "total": 1,
+            "roll_count": 1,
+            "most_roasted_id": f"target-{group_id}",
+            "most_roasted_count": 2,
+        }
+
+    async def summary_enabled(group_id: str):
+        return group_id == "10001"
+
+    monkeypatch.setattr(module, "rollpig_date_str", lambda: current_date)
+    monkeypatch.setattr(module.asyncio, "sleep", cross_midnight)
+    monkeypatch.setattr(module, "build_daily_summary", build_summary)
+    monkeypatch.setattr(
+        module,
+        "is_group_rollpig_enabled",
+        lambda group_id: group_id != "10003",
+    )
+    monkeypatch.setattr(module, "is_daily_summary_push_enabled", summary_enabled)
+    monkeypatch.setattr(module, "get_bot", lambda: fake_bot)
+    monkeypatch.setattr(module, "build_daily_summary_panel", lambda summary: {})
+
+    async def render_panel(**_kwargs):
+        return b"panel"
+
+    monkeypatch.setattr(module, "build_panel_picture", render_panel)
+
+    await module.daily_summary_job()
+
+    assert current_date == "2026-04-23"
+    assert fake_store.active_dates == ["2026-04-22"]
+    assert summary_calls == [
+        ("2026-04-22", "10001"),
+        ("2026-04-22", "10002"),
+    ]
+    assert fake_store.protection_calls == [
+        ("10001", ["target-10001"], "2026-04-23"),
+        ("10002", ["target-10002"], "2026-04-23"),
+    ]
+    assert fake_store.prune_calls == [("events", 7), ("history", 14)]
+    assert fake_bot.sent_groups == [10001]
+
+
+@pytest.mark.asyncio
+async def test_daily_summary_job_isolates_group_failures_and_counts_sends(
+    monkeypatch,
+):
+    class FakeStore:
+        def __init__(self):
+            self.protection_calls: list[str] = []
+
+        async def get_active_group_ids(self, _date_str: str):
+            return {"10001", "10002", "10003", "10004", "10005"}
+
+        async def replace_group_protections(
+            self,
+            group_id: str,
+            _user_ids: list[str],
+            _protect_date: str,
+        ):
+            self.protection_calls.append(group_id)
+            if group_id == "10002":
+                raise RuntimeError("protect failed")
+
+        async def prune_events(self, *, days_to_keep: int):
+            assert days_to_keep == 7
+
+        async def prune_history(self, *, days_to_keep: int):
+            assert days_to_keep == 14
+
+    class FakeBot:
+        def __init__(self):
+            self.attempted_groups: list[int] = []
+            self.sent_groups: list[int] = []
+
+        async def send_group_msg(self, *, group_id: int, message):
+            self.attempted_groups.append(group_id)
+            if group_id == 10004:
+                raise RuntimeError("send failed")
+            self.sent_groups.append(group_id)
+
+    fake_store = FakeStore()
+    fake_bot = FakeBot()
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=fake_store,
+        fake_data_manager=object(),
+        group_members=[],
+    )
+
+    async def no_sleep(_delay: int):
+        return None
+
+    async def build_summary(_store, *, date_str: str, group_id: str):
+        assert date_str == "2026-04-22"
+        if group_id == "10001":
+            raise RuntimeError("summary failed")
+        return {
+            "group_id": group_id,
+            "total": 0,
+            "roll_count": 1,
+            "most_roasted_id": None,
+            "most_roasted_count": 0,
+        }
+
+    async def render_panel(*, group_id: str):
+        if group_id == "10003":
+            raise RuntimeError("render failed")
+        return f"panel-{group_id}".encode()
+
+    async def summary_enabled(_group_id: str):
+        return True
+
+    monkeypatch.setattr(module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(module, "build_daily_summary", build_summary)
+    monkeypatch.setattr(module, "get_bot", lambda: fake_bot)
+    monkeypatch.setattr(module, "is_daily_summary_push_enabled", summary_enabled)
+    monkeypatch.setattr(
+        module,
+        "build_daily_summary_panel",
+        lambda summary: {"group_id": summary["group_id"]},
+    )
+    monkeypatch.setattr(module, "build_panel_picture", render_panel)
+    monkeypatch.setattr(
+        module,
+        "build_daily_summary_text",
+        lambda summary: f"text-{summary['group_id']}",
+    )
+
+    await module.daily_summary_job()
+
+    assert fake_store.protection_calls == ["10002", "10003", "10004", "10005"]
+    assert fake_bot.attempted_groups == [10003, 10004, 10005]
+    assert fake_bot.sent_groups == [10003, 10005]
+    assert any("group=10001" in message for message in module.logger.warning_messages)
+    assert any("group=10002" in message for message in module.logger.warning_messages)
+    assert any("group=10003" in message for message in module.logger.warning_messages)
+    assert any("group=10004" in message for message in module.logger.warning_messages)
+    assert module.logger.info_messages[-1].endswith(
+        "date=2026-04-22 summaries=3 pending=3 sent=2"
+    )
+
+
+def test_daily_summary_job_uses_shanghai_timezone(monkeypatch):
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=object(),
+        fake_data_manager=object(),
+        group_members=[],
+    )
+
+    cron_jobs = [
+        kwargs
+        for _args, kwargs in module.scheduler.jobs
+        if kwargs.get("id") == "rollpig_daily_summary"
+    ]
+    assert cron_jobs == [
+        {
+            "hour": 23,
+            "minute": 45,
+            "timezone": "Asia/Shanghai",
+            "id": "rollpig_daily_summary",
+        }
+    ]
 
 
 def test_migrate_old_data_adds_collection_progress(monkeypatch, tmp_path):
