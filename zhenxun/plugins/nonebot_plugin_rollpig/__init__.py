@@ -49,7 +49,11 @@ from .config import (
     get_storage_backend,
 )
 from .catalog_renderer import render_catalog_image, get_harmony_font_faces
-from .card_renderer import render_pig_card_image
+from .card_renderer import (
+    clear_card_renderer_runtime_cache,
+    render_pig_card_image,
+    shutdown_card_renderer,
+)
 from .render_budget import html_render_budget
 from .resource_manager import pig_resource_manager
 from .roast_manager import roast_manager
@@ -135,7 +139,7 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
     extra={
         "author": "Felis2026",
-        "version": "0.7.4",
+        "version": "0.7.6",
         "configs": [
             {
                 "module": MODULE_NAME,
@@ -361,6 +365,22 @@ __plugin_meta__ = PluginMetadata(
                 "help": "rollpig HTML 图片渲染总并发预算",
                 "type": int,
             },
+            {
+                "module": MODULE_NAME,
+                "key": "GIF_RENDER_CONCURRENCY",
+                "value": 2,
+                "default_value": 2,
+                "help": "Pillow GIF 卡片首次生成并发预算，范围 1-2",
+                "type": int,
+            },
+            {
+                "module": MODULE_NAME,
+                "key": "CARD_DISK_CACHE_MAX_MB",
+                "value": 64,
+                "default_value": 64,
+                "help": "固定小猪卡片磁盘 LRU 上限（MiB），设为 0 可关闭",
+                "type": int,
+            },
         ],
         "group_config_model": GroupSettings,
     },
@@ -400,6 +420,7 @@ def reload_rollpig_resources() -> None:
     """刷新资源管理器快照，并同步旧接口使用的全局引用。"""
     global PIG_LIST, PIG_RULES
     pig_resource_manager.reload()
+    clear_card_renderer_runtime_cache()
     PIG_LIST = pig_resource_manager.pig_list
     PIG_RULES = pig_resource_manager.rules
 
@@ -470,6 +491,7 @@ async def _shutdown_rollpig_runtime() -> None:
         with suppress(asyncio.CancelledError):
             await task
     resource_sync_tasks.clear()
+    await shutdown_card_renderer()
 
 
 def get_food_pig_ids() -> list[str]:
@@ -1398,7 +1420,12 @@ async def _render_pig_card_html(
 
 
 async def send_rendered_pig(
-    matcher, event, pig_data: dict, extra_text: str = "", is_new: bool = False
+    matcher,
+    event,
+    pig_data: dict,
+    extra_text: str = "",
+    is_new: bool = False,
+    cache_final_card: bool = True,
 ):
     pig_id = str(pig_data.get("id") or "")
     avatar_file = find_image_file(pig_id)
@@ -1407,6 +1434,8 @@ async def send_rendered_pig(
             pig_data,
             avatar_file,
             is_new=is_new,
+            cache_final_card=cache_final_card,
+            resource_version=pig_resource_manager.resource_version,
         )
         pic = render_result.data
     except Exception as error:
@@ -1713,7 +1742,12 @@ async def _(event: Event):
                 group_id=group_id,
             )
         )
-    await send_rendered_pig(cmd_roast, event, roasted_pig_data)
+    await send_rendered_pig(
+        cmd_roast,
+        event,
+        roasted_pig_data,
+        cache_final_card=False,
+    )
 
 
 # 5.5 烤群友
@@ -1942,7 +1976,13 @@ async def _(bot: Bot, event: GroupMessageEvent):
         )
         roasted_data = food_pig_template.copy()
         roasted_data["analysis"] = text
-        await send_rendered_pig(cmd_roast_member, event, roasted_data, extra_text=prefix_text)
+        await send_rendered_pig(
+            cmd_roast_member,
+            event,
+            roasted_data,
+            extra_text=prefix_text,
+            cache_final_card=False,
+        )
         return
 
     # --- 普通模式概率判定 ---
@@ -1978,7 +2018,12 @@ async def _(bot: Bot, event: GroupMessageEvent):
         )
         roasted_data = food_pig_template.copy()
         roasted_data["analysis"] = text
-        await send_rendered_pig(cmd_roast_member, event, roasted_data)
+        await send_rendered_pig(
+            cmd_roast_member,
+            event,
+            roasted_data,
+            cache_final_card=False,
+        )
 
     # === 逃脱 (30%) ===
     elif roll <= 90:
@@ -2037,7 +2082,12 @@ async def _(bot: Bot, event: GroupMessageEvent):
             )
             roasted_data = food_pig_template.copy()
             roasted_data["analysis"] = fail_text
-            await send_rendered_pig(cmd_roast_member, event, roasted_data)
+            await send_rendered_pig(
+                cmd_roast_member,
+                event,
+                roasted_data,
+                cache_final_card=False,
+            )
         else:
             fail_text = pick_backfire_text(
                 attacker_full_display,
@@ -2230,7 +2280,13 @@ async def _(bot: Bot, event: GroupMessageEvent):
         )
         roasted_data = food_pig_template.copy()
         roasted_data["analysis"] = text
-        await send_rendered_pig(cmd_random_roast, event, roasted_data, extra_text=intro)
+        await send_rendered_pig(
+            cmd_random_roast,
+            event,
+            roasted_data,
+            extra_text=intro,
+            cache_final_card=False,
+        )
 
     # 逃脱 (30%)
     elif roll <= 90:
@@ -2287,7 +2343,13 @@ async def _(bot: Bot, event: GroupMessageEvent):
             )
             roasted_data = food_pig_template.copy()
             roasted_data["analysis"] = fail_text
-            await send_rendered_pig(cmd_random_roast, event, roasted_data, extra_text=intro)
+            await send_rendered_pig(
+                cmd_random_roast,
+                event,
+                roasted_data,
+                extra_text=intro,
+                cache_final_card=False,
+            )
         else:
             fail_text = pick_backfire_text(
                 attacker_full_display,

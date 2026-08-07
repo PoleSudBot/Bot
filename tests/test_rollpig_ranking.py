@@ -5,8 +5,11 @@ import hashlib
 import importlib.util
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import sys
+import threading
+import time
 import types
 import uuid
 
@@ -506,9 +509,37 @@ def load_rollpig_catalog_renderer_module(
     return module
 
 
-def load_rollpig_card_renderer_module():
+def load_rollpig_card_renderer_module(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    card_cache_max_mb: int = 0,
+    gif_render_concurrency: int = 2,
+):
+    fake_nonebot_log = types.ModuleType("nonebot.log")
+    fake_nonebot_log.logger = FakeLogger()
+    fake_localstore = types.ModuleType("nonebot_plugin_localstore")
+    fake_localstore.get_plugin_cache_dir = lambda: tmp_path / "cache"
+
+    package_name = f"rollpig_card_testpkg_{uuid.uuid4().hex}"
+    fake_package = types.ModuleType(package_name)
+    fake_package.__path__ = [str(ROLLPIG_PLUGIN_DIR)]
+    fake_config = types.ModuleType(f"{package_name}.config")
+    fake_config.get_card_disk_cache_max_bytes = (
+        lambda: card_cache_max_mb * 1024 * 1024
+    )
+    fake_config.get_gif_render_concurrency = lambda: gif_render_concurrency
+
+    for name, module in {
+        "nonebot.log": fake_nonebot_log,
+        "nonebot_plugin_localstore": fake_localstore,
+        package_name: fake_package,
+        f"{package_name}.config": fake_config,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
     return load_module_from_path(
-        f"rollpig_card_renderer_test_{uuid.uuid4().hex}",
+        f"{package_name}.card_renderer",
         ROLLPIG_CARD_RENDERER_PATH,
     )
 
@@ -772,6 +803,12 @@ def load_rollpig_plugin_module(
 
     fake_card_renderer = types.ModuleType(f"{package_name}.card_renderer")
     fake_card_renderer.render_pig_card_image = fake_render_pig_card_image
+    fake_card_renderer.clear_card_renderer_runtime_cache = lambda: None
+
+    async def fake_shutdown_card_renderer():
+        return None
+
+    fake_card_renderer.shutdown_card_renderer = fake_shutdown_card_renderer
 
     fake_render_budget = types.ModuleType(f"{package_name}.render_budget")
     fake_render_budget.html_render_budget = lambda _label: FakeAsyncContext()
@@ -2010,6 +2047,8 @@ def test_catalog_config_invalid_values_fall_back_to_safe_defaults(monkeypatch):
             "CATALOG_CACHE_SECONDS": "bad",
             "CATALOG_RENDER_TIMEOUT": "bad",
             "HTML_RENDER_CONCURRENCY": "bad",
+            "GIF_RENDER_CONCURRENCY": "bad",
+            "CARD_DISK_CACHE_MAX_MB": "bad",
         },
     )
     clamped_module = load_rollpig_config_module(
@@ -2018,15 +2057,22 @@ def test_catalog_config_invalid_values_fall_back_to_safe_defaults(monkeypatch):
             "CATALOG_CACHE_SECONDS": -30,
             "CATALOG_RENDER_TIMEOUT": 0,
             "HTML_RENDER_CONCURRENCY": 99,
+            "GIF_RENDER_CONCURRENCY": 99,
+            "CARD_DISK_CACHE_MAX_MB": 999,
         },
     )
 
     assert invalid_module.get_catalog_cache_seconds() == 300
     assert invalid_module.get_catalog_render_timeout() == 8.0
     assert invalid_module.get_html_render_concurrency() == 2
+    assert invalid_module.get_gif_render_concurrency() == 2
+    assert invalid_module.get_card_disk_cache_max_mb() == 64
+    assert invalid_module.get_card_disk_cache_max_bytes() == 64 * 1024 * 1024
     assert clamped_module.get_catalog_cache_seconds() == 0
     assert clamped_module.get_catalog_render_timeout() == 1.0
     assert clamped_module.get_html_render_concurrency() == 6
+    assert clamped_module.get_gif_render_concurrency() == 2
+    assert clamped_module.get_card_disk_cache_max_mb() == 64
 
 
 def test_roast_charge_config_defaults_and_runtime_clamps(monkeypatch):
@@ -2075,6 +2121,30 @@ def test_roast_commands_pass_charge_max_to_cooldown():
         keyword_names = {keyword.arg for keyword in call.keywords}
         assert "cooldown_seconds" in keyword_names
         assert "max_charges" in keyword_names
+
+
+def test_roast_card_calls_disable_final_cache():
+    tree = ast.parse(ROLLPIG_PLUGIN_INIT_PATH.read_text(encoding="utf-8"))
+    roasted_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "send_rendered_pig"
+        and len(node.args) >= 3
+        and isinstance(node.args[2], ast.Name)
+        and node.args[2].id.startswith("roasted")
+    ]
+
+    assert len(roasted_calls) == 6
+    for call in roasted_calls:
+        cache_keyword = next(
+            (keyword for keyword in call.keywords if keyword.arg == "cache_final_card"),
+            None,
+        )
+        assert cache_keyword is not None
+        assert isinstance(cache_keyword.value, ast.Constant)
+        assert cache_keyword.value.value is False
 
 
 def build_roast_event(*, plaintext: str = "烤群友"):
@@ -3108,8 +3178,8 @@ async def test_rollpig_overlay_sync_continues_after_one_pack_fails(
 
 
 @pytest.mark.asyncio
-async def test_rollpig_pillow_card_renders_static_png(tmp_path):
-    module = load_rollpig_card_renderer_module()
+async def test_rollpig_pillow_card_renders_static_png(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
     image_file = tmp_path / "pig.png"
     new_icon_file = tmp_path / "new.png"
     Image.new("RGBA", (240, 240), (255, 120, 160, 255)).save(image_file)
@@ -3134,8 +3204,8 @@ async def test_rollpig_pillow_card_renders_static_png(tmp_path):
     assert rendered.getpixel((400, 200)) == (20, 200, 80)
 
 
-def test_rollpig_pillow_avatar_preserves_original_canvas_size():
-    module = load_rollpig_card_renderer_module()
+def test_rollpig_pillow_avatar_preserves_original_canvas_size(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
     canvas = Image.new("RGBA", (800, 800), (255, 255, 255, 255))
     avatar = Image.new("RGBA", (400, 200), (255, 0, 0, 255))
 
@@ -3148,8 +3218,11 @@ def test_rollpig_pillow_avatar_preserves_original_canvas_size():
 
 
 @pytest.mark.asyncio
-async def test_rollpig_pillow_card_preserves_gif_frames_and_duration(tmp_path):
-    module = load_rollpig_card_renderer_module()
+async def test_rollpig_pillow_card_preserves_gif_frames_and_duration(
+    monkeypatch,
+    tmp_path,
+):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
     image_file = tmp_path / "pig.gif"
     frames = [
         Image.new("RGBA", (240, 240), color)
@@ -3184,6 +3257,546 @@ async def test_rollpig_pillow_card_preserves_gif_frames_and_duration(tmp_path):
     assert rendered.size == (800, 800)
     assert rendered.n_frames == 2
     assert durations == [40, 120]
+
+
+@pytest.mark.asyncio
+async def test_rollpig_single_frame_gif_renders_static_png(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    image_file = tmp_path / "single.gif"
+    with Image.new("RGBA", (240, 240), (255, 0, 0, 255)) as frame:
+        frame.save(image_file, format="GIF")
+
+    result = await module.render_pig_card_image(
+        {
+            "id": "single",
+            "name": "静态小猪",
+            "description": "单帧 GIF",
+            "analysis": "单帧资源应走 PNG 卡片。",
+        },
+        image_file,
+        cache_final_card=False,
+    )
+
+    assert result.image_format == "png"
+    assert result.renderer == "pillow"
+
+
+def _write_rollpig_test_gif(
+    image_file: Path,
+    *,
+    frame_count: int,
+    duration: int = 40,
+    size: tuple[int, int] = (16, 16),
+) -> None:
+    frames = [
+        Image.new(
+            "RGBA",
+            size,
+            (
+                (index * 17) % 256,
+                (index * 31) % 256,
+                (index * 47) % 256,
+                255,
+            ),
+        )
+        for index in range(frame_count)
+    ]
+    try:
+        frames[0].save(
+            image_file,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=[duration] * frame_count,
+            loop=0,
+        )
+    finally:
+        for frame in frames:
+            frame.close()
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "expected_count"),
+    [(1, 1), (10, 10), (60, 60), (75, 60), (600, 60)],
+)
+def test_rollpig_gif_frame_groups_cover_supported_counts(
+    monkeypatch,
+    tmp_path,
+    frame_count,
+    expected_count,
+):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    groups = module._gif_frame_groups(frame_count)
+
+    assert len(groups) == expected_count
+    assert groups[0][0] == 0
+    assert groups[-1][1] == frame_count
+    assert all(start < end for start, end, _representative in groups)
+
+
+def test_rollpig_gif_sampling_covers_full_cycle_and_duration(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    image_file = tmp_path / "long.gif"
+    _write_rollpig_test_gif(image_file, frame_count=75)
+
+    decoded = module._decode_gif_frames(image_file)
+    try:
+        assert len(decoded) == 60
+        assert sum(duration for _frame, duration in decoded) == 75 * 40
+        groups = module._gif_frame_groups(75)
+        with Image.open(image_file) as opened:
+            opened.seek(groups[0][2])
+            expected_first = opened.convert("RGBA").getpixel((0, 0))
+            opened.seek(groups[-1][2])
+            expected_last = opened.convert("RGBA").getpixel((0, 0))
+        assert decoded[0][0].getpixel((0, 0)) == expected_first
+        assert decoded[-1][0].getpixel((0, 0)) == expected_last
+    finally:
+        module._close_frames(decoded)
+
+
+def test_rollpig_gif_over_decode_budget_falls_back_to_static(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    image_file = tmp_path / "over-budget.gif"
+    _write_rollpig_test_gif(image_file, frame_count=2)
+    monkeypatch.setattr(module, "GIF_MAX_DECODE_WORK_PIXELS", 1)
+
+    assert module._decode_gif_frames(image_file) == []
+
+
+def test_rollpig_gif_over_frame_limit_skips_decode(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+
+    class OversizedGif:
+        n_frames = 601
+        width = 1
+        height = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def seek(self, _frame_index):
+            pytest.fail("over-limit GIF must not seek source frames")
+
+    monkeypatch.setattr(module.Image, "open", lambda _path: OversizedGif())
+
+    assert module._decode_gif_frames(tmp_path / "too-many.gif") == []
+
+
+def test_rollpig_gif_decode_failure_closes_selected_frames(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    created_frames = []
+
+    class TrackedFrame:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class BrokenGif:
+        n_frames = 3
+        width = 1
+        height = 1
+        info = {"duration": 40}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def seek(self, frame_index):
+            if frame_index == 1:
+                raise OSError("broken frame")
+
+        def convert(self, _mode):
+            frame = TrackedFrame()
+            created_frames.append(frame)
+            return frame
+
+    monkeypatch.setattr(module.Image, "open", lambda _path: BrokenGif())
+
+    assert module._decode_gif_frames(tmp_path / "broken.gif") == []
+    assert created_frames
+    assert all(frame.closed for frame in created_frames)
+
+
+def test_rollpig_gif_source_frames_use_bounded_lru(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    image_file = tmp_path / "source.gif"
+    _write_rollpig_test_gif(image_file, frame_count=2)
+    decode_calls = 0
+    real_decode = module._decode_gif_frames
+
+    def counted_decode(path):
+        nonlocal decode_calls
+        decode_calls += 1
+        return real_decode(path)
+
+    monkeypatch.setattr(module, "_decode_gif_frames", counted_decode)
+    first = module._load_gif_frames(image_file, "source-key")
+    second = module._load_gif_frames(image_file, "source-key")
+    module._close_frames(first)
+    module._close_frames(second)
+
+    assert decode_calls == 1
+    assert list(module._gif_source_cache) == ["source-key"]
+
+    monkeypatch.setattr(module, "GIF_SOURCE_CACHE_MAX_ENTRIES", 2)
+    one_pixel = [(Image.new("RGBA", (1, 1)), 40)]
+    try:
+        module._store_gif_frames("second", one_pixel)
+        module._store_gif_frames("third", one_pixel)
+    finally:
+        module._close_frames(one_pixel)
+    assert list(module._gif_source_cache) == ["second", "third"]
+    module.clear_card_renderer_runtime_cache()
+    assert not module._gif_source_cache
+
+
+def test_rollpig_gif_source_lru_closes_byte_evictions(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    cached_copies = []
+
+    class TrackedFrame:
+        width = 1
+        height = 1
+
+        def __init__(self):
+            self.closed = False
+
+        def copy(self):
+            copied = TrackedFrame()
+            cached_copies.append(copied)
+            return copied
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(module, "GIF_SOURCE_CACHE_MAX_BYTES", 8)
+    source_frame = TrackedFrame()
+    for key in ("first", "second", "third"):
+        module._store_gif_frames(key, [(source_frame, 40)])
+
+    assert list(module._gif_source_cache) == ["second", "third"]
+    assert cached_copies[0].closed
+    module.clear_card_renderer_runtime_cache()
+    assert all(frame.closed for frame in cached_copies)
+
+
+@pytest.mark.asyncio
+async def test_rollpig_card_singleflight_isolates_waiter_cancellation(
+    monkeypatch,
+    tmp_path,
+):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    render_started = threading.Event()
+    release_render = threading.Event()
+    render_calls = 0
+
+    monkeypatch.setattr(
+        module,
+        "_build_card_fingerprint",
+        lambda *_args, **_kwargs: module._CardFingerprint("same", None),
+    )
+
+    def fake_render(*_args, **_kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        render_started.set()
+        release_render.wait(timeout=2)
+        return module.PigCardRenderResult(b"singleflight", "png", "pillow")
+
+    monkeypatch.setattr(module, "_render_sync", fake_render)
+    first = asyncio.create_task(
+        module.render_pig_card_image({}, None, cache_final_card=False)
+    )
+    await asyncio.to_thread(render_started.wait, 2)
+    second = asyncio.create_task(
+        module.render_pig_card_image({}, None, cache_final_card=False)
+    )
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release_render.set()
+
+    result = await second
+    assert result.data == b"singleflight"
+    assert render_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [1, 2])
+async def test_rollpig_gif_render_concurrency_is_bounded(
+    monkeypatch,
+    tmp_path,
+    concurrency,
+):
+    module = load_rollpig_card_renderer_module(
+        monkeypatch,
+        tmp_path,
+        gif_render_concurrency=concurrency,
+    )
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        module,
+        "_build_card_fingerprint",
+        lambda pig_data, *_args, **_kwargs: module._CardFingerprint(
+            str(pig_data["id"]),
+            str(pig_data["id"]),
+        ),
+    )
+
+    def fake_render(*_args, **_kwargs):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+        return module.PigCardRenderResult(b"gif", "gif", "pillow-gif")
+
+    monkeypatch.setattr(module, "_render_sync", fake_render)
+    image_file = tmp_path / "virtual.gif"
+    await asyncio.gather(
+        *[
+            module.render_pig_card_image(
+                {"id": str(index)},
+                image_file,
+                cache_final_card=False,
+            )
+            for index in range(6)
+        ]
+    )
+
+    assert max_active == concurrency
+
+
+@pytest.mark.asyncio
+async def test_rollpig_static_card_does_not_use_gif_semaphore(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_build_card_fingerprint",
+        lambda *_args, **_kwargs: module._CardFingerprint("static", None),
+    )
+    monkeypatch.setattr(
+        module,
+        "_get_gif_render_semaphore",
+        lambda: pytest.fail("static render must not acquire GIF semaphore"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_render_sync",
+        lambda *_args, **_kwargs: module.PigCardRenderResult(b"png", "png", "pillow"),
+    )
+
+    result = await module.render_pig_card_image(
+        {},
+        tmp_path / "static.png",
+        cache_final_card=False,
+    )
+    assert result.image_format == "png"
+
+
+def test_rollpig_gif_quantizes_one_rgb_frame_at_a_time(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    active_rgb = 0
+    max_active_rgb = 0
+    composed_frames = []
+
+    class TrackedRgb:
+        def __enter__(self):
+            nonlocal active_rgb, max_active_rgb
+            active_rgb += 1
+            max_active_rgb = max(max_active_rgb, active_rgb)
+            return self
+
+        def __exit__(self, *_args):
+            nonlocal active_rgb
+            active_rgb -= 1
+
+        def quantize(self, **_kwargs):
+            return Image.new("P", (1, 1))
+
+    class ComposedFrame:
+        def __init__(self):
+            self.closed = False
+
+        def convert(self, _mode):
+            return TrackedRgb()
+
+        def close(self):
+            self.closed = True
+
+    def compose(*_args, **_kwargs):
+        frame = ComposedFrame()
+        composed_frames.append(frame)
+        return frame
+
+    palette = Image.new("P", (1, 1))
+    monkeypatch.setattr(module, "_build_gif_palette", lambda *_args, **_kwargs: palette)
+    monkeypatch.setattr(module, "_compose_gif_frame", compose)
+    prepared = module._PreparedCard(Image.new("RGBA", (1, 1)), 0)
+    avatar_frames = [(Image.new("RGBA", (1, 1)), 40) for _index in range(4)]
+    try:
+        result = module._encode_gif(prepared, avatar_frames, is_new=False)
+    finally:
+        prepared.canvas.close()
+        module._close_frames(avatar_frames)
+
+    assert result.image_format == "gif"
+    assert max_active_rgb == 1
+    assert active_rgb == 0
+    assert all(frame.closed for frame in composed_frames)
+
+
+@pytest.mark.asyncio
+async def test_rollpig_fixed_card_disk_cache_survives_module_reload(
+    monkeypatch,
+    tmp_path,
+):
+    first_module = load_rollpig_card_renderer_module(
+        monkeypatch,
+        tmp_path,
+        card_cache_max_mb=64,
+    )
+    render_calls = 0
+
+    monkeypatch.setattr(
+        first_module,
+        "_build_card_fingerprint",
+        lambda *_args, **_kwargs: first_module._CardFingerprint("fixed", None),
+    )
+
+    def fake_render(*_args, **_kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        return first_module.PigCardRenderResult(b"cached-card", "png", "pillow")
+
+    monkeypatch.setattr(first_module, "_render_sync", fake_render)
+    first = await first_module.render_pig_card_image({}, None)
+    second = await first_module.render_pig_card_image({}, None)
+    assert first == second
+    assert render_calls == 1
+
+    reloaded_module = load_rollpig_card_renderer_module(
+        monkeypatch,
+        tmp_path,
+        card_cache_max_mb=64,
+    )
+    monkeypatch.setattr(
+        reloaded_module,
+        "_build_card_fingerprint",
+        lambda *_args, **_kwargs: reloaded_module._CardFingerprint("fixed", None),
+    )
+    monkeypatch.setattr(
+        reloaded_module,
+        "_render_sync",
+        lambda *_args, **_kwargs: pytest.fail("disk cache should bypass renderer"),
+    )
+    restarted = await reloaded_module.render_pig_card_image({}, None)
+    assert restarted.data == b"cached-card"
+
+
+@pytest.mark.asyncio
+async def test_rollpig_dynamic_card_skips_final_disk_cache(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(
+        monkeypatch,
+        tmp_path,
+        card_cache_max_mb=64,
+    )
+    render_calls = 0
+    monkeypatch.setattr(
+        module,
+        "_build_card_fingerprint",
+        lambda *_args, **_kwargs: module._CardFingerprint("dynamic", None),
+    )
+
+    def fake_render(*_args, **_kwargs):
+        nonlocal render_calls
+        render_calls += 1
+        return module.PigCardRenderResult(b"dynamic", "png", "pillow")
+
+    monkeypatch.setattr(module, "_render_sync", fake_render)
+    await module.render_pig_card_image({}, None, cache_final_card=False)
+    await asyncio.sleep(0)
+    await module.render_pig_card_image({}, None, cache_final_card=False)
+
+    assert render_calls == 2
+    assert not list(module.CARD_CACHE_DIR.glob("*.card"))
+
+
+def test_rollpig_card_fingerprint_hashes_source_content(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    source = tmp_path / "source.png"
+    regular_font = tmp_path / "regular.ttf"
+    bold_font = tmp_path / "bold.ttf"
+    source.write_bytes(b"first")
+    regular_font.write_bytes(b"regular")
+    bold_font.write_bytes(b"bold")
+    monkeypatch.setattr(module, "REGULAR_FONT", regular_font)
+    monkeypatch.setattr(module, "BOLD_FONT", bold_font)
+    original_stat = source.stat()
+
+    first = module._build_card_fingerprint(
+        {"id": "pig", "name": "小猪"},
+        source,
+        is_new=False,
+        resource_version="same-version",
+    )
+    source.write_bytes(b"other")
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    second = module._build_card_fingerprint(
+        {"id": "pig", "name": "小猪"},
+        source,
+        is_new=False,
+        resource_version="same-version",
+    )
+
+    assert first.card_key != second.card_key
+    assert first.source_key != second.source_key
+
+    font_stat = regular_font.stat()
+    regular_font.write_bytes(b"changed")
+    os.utime(regular_font, ns=(font_stat.st_atime_ns, font_stat.st_mtime_ns))
+    third = module._build_card_fingerprint(
+        {"id": "pig", "name": "小猪"},
+        source,
+        is_new=False,
+        resource_version="same-version",
+    )
+    assert second.card_key != third.card_key
+
+
+def test_rollpig_card_disk_cache_prunes_and_rejects_corruption(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    max_bytes = 900
+    for index in range(3):
+        module._store_fixed_card(
+            f"key-{index}",
+            module.PigCardRenderResult(bytes([index]) * 400, "png", "pillow"),
+            max_bytes,
+        )
+
+    cache_files = list(module.CARD_CACHE_DIR.glob("*.card"))
+    assert sum(path.stat().st_size for path in cache_files) <= max_bytes
+    newest = module._card_cache_path("key-2")
+    assert newest.exists()
+
+    corrupt = module._card_cache_path("corrupt")
+    corrupt.write_bytes(b"broken")
+    assert module._get_fixed_card("corrupt", max_bytes) is None
+    assert not corrupt.exists()
 
 
 def test_rollpig_private_overlay_rejects_duplicate_pig_ids(monkeypatch, tmp_path):

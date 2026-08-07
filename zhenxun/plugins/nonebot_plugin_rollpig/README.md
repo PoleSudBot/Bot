@@ -53,6 +53,8 @@
 | `CATALOG_CACHE_SECONDS` | `300` | 同一图鉴状态图片缓存秒数，设为 `0` 可关闭缓存 |
 | `CATALOG_RENDER_TIMEOUT` | `8.0` | 单张小猪图鉴渲染超时时间 |
 | `HTML_RENDER_CONCURRENCY` | `2` | rollpig HTML 图片渲染总并发预算 |
+| `GIF_RENDER_CONCURRENCY` | `2` | Pillow GIF 卡片冷生成并发预算，运行时限制为 `1-2` |
+| `CARD_DISK_CACHE_MAX_MB` | `64` | 固定小猪卡片磁盘 LRU 上限（MiB），运行时限制为 `0-64`，设为 `0` 可关闭 |
 
 ## 图片版图鉴
 
@@ -64,7 +66,11 @@
 - 顶部会展示收集进度、黑白进度条、当前群猪猪排名和本地总排名。
 - 缩略图从当前 active/private/builtin 资源快照读取并缓存到 localstore cache；命令执行时不会临时远程拉图，缺图会显示占位。
 - 渲染结果使用同状态 TTL 缓存和同 key 合流，避免多人同时触发时重复占用 Chromium。
-- 普通小猪卡片使用真寻 `BuildImage` 与 Pillow 绘制；GIF 小猪逐帧合成动态卡片，异常时回退旧 HTML 静态卡片。
+- 普通小猪卡片使用真寻 `BuildImage` 与 Pillow 绘制；GIF 小猪逐帧合成并立即量化，异常时回退旧 HTML 静态卡片。
+- GIF 最多输出 60 帧；长动画按完整周期均匀采样，并把被合并帧的规范化时长累计到代表帧，保持总周期语义。
+- GIF 冷生成最多双并发，相同内容请求会合流；解码后的源帧使用最多 8 条、24 MiB 的进程内 LRU。
+- 今天、昨日等固定卡片会按内容指纹缓存到 localstore 的 `card_results/`，默认总量不超过 64 MiB，命中可跨进程重启复用。
+- 烧烤卡片包含动态文案，不缓存最终成品；GIF 源帧仍可复用。资源、字体、NEW 图标或渲染版本变化会使旧成品自然失效。
 
 ## 资源同步
 

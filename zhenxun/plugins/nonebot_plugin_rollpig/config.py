@@ -73,6 +73,8 @@ class Config(BaseModel):
     CATALOG_CACHE_SECONDS: int = 300
     CATALOG_RENDER_TIMEOUT: float = 8.0
     HTML_RENDER_CONCURRENCY: int = 2
+    GIF_RENDER_CONCURRENCY: int = 2
+    CARD_DISK_CACHE_MAX_MB: int = 64
 
     # Legacy compatibility only. Runtime no longer uses these fields.
     rollpig_ai_enabled: Optional[bool] = None
@@ -301,3 +303,15 @@ def get_catalog_render_timeout() -> float:
 
 def get_html_render_concurrency() -> int:
     return max(1, min(6, _get_int("HTML_RENDER_CONCURRENCY", 2)))
+
+
+def get_gif_render_concurrency() -> int:
+    return max(1, min(2, _get_int("GIF_RENDER_CONCURRENCY", 2)))
+
+
+def get_card_disk_cache_max_mb() -> int:
+    return max(0, min(64, _get_int("CARD_DISK_CACHE_MAX_MB", 64)))
+
+
+def get_card_disk_cache_max_bytes() -> int:
+    return get_card_disk_cache_max_mb() * 1024 * 1024
