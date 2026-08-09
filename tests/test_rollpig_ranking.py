@@ -191,6 +191,28 @@ class FakeResourceManager:
     def find_image_file(self, _pig_id):
         return None
 
+    def resolve_pig_appearance(self, pig_data, ex_level):
+        image_path = self.find_image_file(str(pig_data.get("id") or ""))
+        return types.SimpleNamespace(
+            pig_data=dict(pig_data),
+            image_path=image_path,
+            base_image_path=image_path,
+            requested_level=max(0, int(ex_level or 0)),
+            applied_level=0,
+            resource_version=self.resource_version,
+        )
+
+    def newly_unlocked_variant_levels(
+        self,
+        _pig_id,
+        _previous_level,
+        _current_level,
+    ):
+        return ()
+
+    def variant_change_fields(self, _pig_id, _level):
+        return frozenset()
+
     def get_pig_by_id(self, pig_id):
         return next(
             (item for item in self.pig_list if item["id"] == pig_id),
@@ -854,6 +876,11 @@ def load_rollpig_plugin_module(
         "up {pig} {old_level} {new_level}"
     ]
     fake_texts.DAILY_ROLL_DUPLICATE_SAME_LEVEL_TEXTS = ["same {pig} {level}"]
+    fake_texts.DAILY_ROLL_VARIANT_LEVEL_UP_TEXTS = {
+        "image": ["image {pig} {old_level} {new_level}"],
+        "text": ["text {pig} {old_level} {new_level}"],
+        "image_text": ["both {pig} {old_level} {new_level}"],
+    }
     fake_texts.FOOD_PIG_IDS = set()
     fake_texts.HUMAN_PIG_ID = "human"
     fake_texts.EATEN_PIG_ID = "eaten"
@@ -1753,6 +1780,38 @@ def test_pigsty_growth_summary_keeps_repeat_and_streak_notes(monkeypatch):
     assert any("连续重复：2 次" in note for note in notes)
 
 
+def test_rollpig_growth_text_uses_variant_change_pool(monkeypatch):
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=object(),
+        fake_data_manager=object(),
+        group_members=[],
+    )
+    module.pig_resource_manager.newly_unlocked_variant_levels = (
+        lambda _pig_id, _previous, _current: (2,)
+    )
+    module.pig_resource_manager.variant_change_fields = (
+        lambda _pig_id, _level: frozenset({"image", "text"})
+    )
+    monkeypatch.setattr(module.random, "choice", lambda items: items[0])
+
+    result = FakeDailyRollResult(
+        "pig",
+        created=True,
+        previous_copies=2,
+        copies=3,
+    )
+
+    assert module.build_roll_growth_text(result, {"id": "pig", "name": "小猪"}) == (
+        "both 小猪 1 2"
+    )
+    assert module.build_roll_growth_text(
+        result,
+        {"id": "pig", "name": "小猪"},
+        include_variant=False,
+    ) == "up 小猪 1 2"
+
+
 def test_pigsty_footer_matches_upstream_summary_copy(monkeypatch):
     module = load_rollpig_plugin_module(
         monkeypatch,
@@ -1911,6 +1970,28 @@ def test_catalog_payload_uses_resource_order_locks_missing_and_marks_new(
     assert payload["stats"]["group_rank"] == "#2"
     assert payload["stats"]["total_rank"] == "#5"
     assert payload["favorite"]["name"] == "满级猪"
+
+
+def test_catalog_ex_thumbnail_falls_back_to_base_image(monkeypatch, tmp_path):
+    module = load_rollpig_catalog_renderer_module(monkeypatch, tmp_path)
+    base_image = tmp_path / "pig.png"
+    variant_image = tmp_path / "pig_ex2.png"
+    base_image.write_bytes(VALID_PNG_BYTES)
+    variant_image.write_bytes(b"broken")
+    module.pig_resource_manager.resolve_pig_appearance = lambda pig, level: (
+        types.SimpleNamespace(
+            pig_data=dict(pig),
+            image_path=variant_image,
+            base_image_path=base_image,
+            requested_level=level,
+            applied_level=2,
+        )
+    )
+
+    image_uri = module._image_uri({"id": "pig", "name": "小猪"}, 2)
+
+    assert image_uri
+    assert Path(image_uri.removeprefix("file://")).read_bytes().startswith(b"\x89PNG")
 
 
 def test_catalog_payload_keeps_visible_unranked_cards(monkeypatch, tmp_path):
@@ -2642,6 +2723,170 @@ def test_rollpig_resource_json_accepts_utf8_bom(monkeypatch, tmp_path):
     ]
 
 
+def test_rollpig_ex_variants_resolve_sparse_fields(monkeypatch, tmp_path):
+    module = load_rollpig_resource_manager_module(monkeypatch, tmp_path)
+    manager = module.RollPigResourceManager()
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    base_image = image_dir / "pig.png"
+    variant_image = image_dir / "pig_ex2.png"
+    base_image.write_bytes(VALID_PNG_BYTES)
+    variant_image.write_bytes(VALID_PNG_BYTES)
+    variant_file = tmp_path / "pig_ex_variants.json"
+    variant_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pigs": {
+                    "pig": {
+                        "levels": {
+                            "1": {"description": "EX1 描述"},
+                            "2": {"image": "pig_ex2.png"},
+                            "4": {"analysis": "EX4 分析"},
+                        }
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    manager.pig_list = [
+        {"id": "pig", "name": "小猪", "description": "基础", "analysis": "基础分析"}
+    ]
+    manager.pig_map = {"pig": manager.pig_list[0]}
+    manager.image_dirs = [image_dir]
+    manager.ex_variants = manager._load_ex_variants(
+        variant_file,
+        pig_ids={"pig"},
+        image_dir=image_dir,
+        strict=True,
+    )
+
+    appearance = manager.resolve_pig_appearance(manager.pig_list[0], 4)
+
+    assert appearance.image_path == variant_image
+    assert appearance.base_image_path == base_image
+    assert appearance.pig_data["description"] == "EX1 描述"
+    assert appearance.pig_data["analysis"] == "EX4 分析"
+    assert appearance.applied_level == 4
+    assert manager.available_variant_levels("pig") == (1, 2, 4)
+    assert manager.newly_unlocked_variant_levels("pig", 1, 4) == (2, 4)
+    assert manager.variant_change_fields("pig", 2) == frozenset({"image"})
+
+
+def test_rollpig_private_override_disables_public_ex_variants(monkeypatch, tmp_path):
+    module = load_rollpig_resource_manager_module(monkeypatch, tmp_path)
+    manager = module.RollPigResourceManager()
+    public_images = tmp_path / "public"
+    private_dir = tmp_path / "private"
+    public_images.mkdir()
+    private_dir.mkdir()
+    public_images.joinpath("pig.png").write_bytes(VALID_PNG_BYTES)
+    public_images.joinpath("pig_ex1.png").write_bytes(VALID_PNG_BYTES)
+    private_dir.joinpath("pig.json").write_text("[]", encoding="utf-8")
+    private_dir.joinpath("pig_overrides.json").write_text(
+        json.dumps([{"id": "pig", "name": "私有猪"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    manager.pig_list = [{"id": "pig", "name": "公有猪"}]
+    manager.pig_map = {"pig": manager.pig_list[0]}
+    manager.rules = {key: [] for key in module.RULE_KEYS}
+    manager.image_dirs = [public_images]
+    manager.ex_variants = {
+        "pig": {
+            1: module.PigExVariant(
+                "pig",
+                1,
+                image_path=public_images / "pig_ex1.png",
+            )
+        }
+    }
+
+    manager._apply_private_overlay(private_dir, resource_version="private")
+    appearance = manager.resolve_pig_appearance(manager.pig_map["pig"], 1)
+
+    assert appearance.image_path == public_images / "pig.png"
+    assert appearance.applied_level == 0
+    assert manager.available_variant_levels("pig") == ()
+
+
+@pytest.mark.asyncio
+async def test_rollpig_private_manifest_rejects_ex_variants(monkeypatch, tmp_path):
+    module = load_rollpig_resource_manager_module(monkeypatch, tmp_path)
+    manager = module.RollPigResourceManager()
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "images").mkdir(parents=True)
+    pig_json = b"[]"
+    client = FakeHTTPClient({"https://example.com/private/pig.json": pig_json})
+    manifest = {
+        "pig_json": build_manifest_meta("pig.json", pig_json),
+        "optional_files": {},
+        "images": [],
+        "variant_images": [
+            {
+                "pig_id": "pig",
+                "level": 1,
+                "filename": "pig_ex1.png",
+            }
+        ],
+    }
+
+    with pytest.raises(ValueError, match="私有 Overlay"):
+        await manager._download_private_manifest_files(
+            client,
+            manifest_url="https://example.com/private/manifest.json",
+            manifest=manifest,
+            staging_dir=staging_dir,
+            max_size=1024 * 1024,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rollpig_public_manifest_requires_variant_image_mapping(
+    monkeypatch,
+    tmp_path,
+):
+    module = load_rollpig_resource_manager_module(monkeypatch, tmp_path)
+    manager = module.RollPigResourceManager()
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "images").mkdir(parents=True)
+    pig_json = b'[{"id": "pig", "name": "Pig"}]'
+    variant_json = json.dumps(
+        {
+            "schema_version": 1,
+            "pigs": {"pig": {"levels": {"1": {"image": "pig_ex1.png"}}}},
+        }
+    ).encode()
+    client = FakeHTTPClient(
+        {
+            "https://example.com/resources/pig.json": pig_json,
+            "https://example.com/resources/pig_ex_variants.json": variant_json,
+        }
+    )
+    manifest = {
+        "pig_json": build_manifest_meta("pig.json", pig_json),
+        "optional_files": {
+            "pig_ex_variants": build_manifest_meta(
+                "pig_ex_variants.json",
+                variant_json,
+            )
+        },
+        "images": [],
+        "variant_images": [],
+    }
+
+    with pytest.raises(ValueError, match="未写入 manifest"):
+        await manager._download_manifest_files(
+            client,
+            manifest_url="https://example.com/resources/manifest.json",
+            manifest=manifest,
+            staging_dir=staging_dir,
+            max_size=1024 * 1024,
+        )
+
+
 @pytest.mark.asyncio
 async def test_rollpig_resource_sync_accepts_decodable_image_mismatch(
     monkeypatch,
@@ -2955,6 +3200,76 @@ async def test_rollpig_card_falls_back_to_html_when_pillow_fails(monkeypatch):
     assert sent == ["reply:image:fallback-card"]
 
 
+@pytest.mark.asyncio
+async def test_rollpig_ex_card_falls_back_to_base_resource(monkeypatch, tmp_path):
+    module = load_rollpig_plugin_module(
+        monkeypatch,
+        fake_store=types.SimpleNamespace(),
+        fake_data_manager=types.SimpleNamespace(),
+        group_members=[],
+    )
+    base_image = tmp_path / "pig.png"
+    variant_image = tmp_path / "pig_ex1.png"
+    base_image.write_bytes(VALID_PNG_BYTES)
+    variant_image.write_bytes(b"broken")
+    calls: list[tuple[dict, Path | None, bool]] = []
+    sent: list[object] = []
+
+    module.pig_resource_manager.resolve_pig_appearance = lambda pig, _level: (
+        types.SimpleNamespace(
+            pig_data={**pig, "analysis": "EX 分析"},
+            image_path=variant_image,
+            base_image_path=base_image,
+            requested_level=1,
+            applied_level=1,
+        )
+    )
+
+    async def render_card(pig_data, image_file, **kwargs):
+        calls.append((dict(pig_data), image_file, kwargs["require_avatar"]))
+        if image_file == variant_image:
+            raise ValueError("broken variant")
+        return types.SimpleNamespace(
+            data=b"base-card",
+            image_format="png",
+            renderer="pillow",
+        )
+
+    class CaptureMatcher:
+        async def finish(self, message):
+            sent.append(message)
+
+    class CaptureMessageSegment:
+        reply = staticmethod(lambda _message_id: "reply:")
+        image = staticmethod(lambda data: f"image:{data.decode()}")
+
+    monkeypatch.setattr(module, "render_pig_card_image", render_card)
+    monkeypatch.setattr(module, "MessageSegment", CaptureMessageSegment)
+
+    await module.send_rendered_pig(
+        CaptureMatcher(),
+        types.SimpleNamespace(message_id=1),
+        {"id": "pig", "name": "基础猪", "analysis": "基础分析"},
+        extra_text="解锁新外观",
+        fallback_extra_text="普通升级",
+        ex_level=1,
+    )
+
+    assert calls == [
+        (
+            {"id": "pig", "name": "基础猪", "analysis": "EX 分析"},
+            variant_image,
+            True,
+        ),
+        (
+            {"id": "pig", "name": "基础猪", "analysis": "基础分析"},
+            base_image,
+            False,
+        ),
+    ]
+    assert sent == ["reply:普通升级\nimage:base-card"]
+
+
 def test_rollpig_date_str_uses_business_timezone(monkeypatch):
     module = load_rollpig_runtime_module(monkeypatch)
     real_datetime = module.datetime.datetime
@@ -3047,6 +3362,59 @@ def test_rollpig_resource_merge_retains_legacy_ids_and_images(monkeypatch, tmp_p
     assert merged_rules["food_pigs"] == ["old-pig"]
     assert merged_rules["sold_pigs"] == ["new-pig"]
     assert staging_dir.joinpath("images", "old-pig.png").read_bytes() == b"legacy-image"
+
+
+def test_rollpig_resource_merge_retains_removed_pig_ex_variants(
+    monkeypatch,
+    tmp_path,
+):
+    module = load_rollpig_resource_manager_module(monkeypatch, tmp_path)
+    active_dir = module.ACTIVE_RESOURCE_DIR
+    active_images = active_dir / "images"
+    staging_dir = tmp_path / "staging"
+    active_images.mkdir(parents=True)
+    (staging_dir / "images").mkdir(parents=True)
+    active_dir.joinpath("pig.json").write_text(
+        json.dumps([{"id": "old-pig", "name": "旧猪"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    active_dir.joinpath("pig_ex_variants.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "pigs": {
+                    "old-pig": {
+                        "levels": {
+                            "2": {
+                                "image": "old-pig_ex2.png",
+                                "analysis": "旧 EX 分析",
+                            }
+                        }
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    active_images.joinpath("old-pig.png").write_bytes(VALID_PNG_BYTES)
+    active_images.joinpath("old-pig_ex2.png").write_bytes(VALID_PNG_BYTES)
+    staging_dir.joinpath("pig.json").write_text(
+        json.dumps([{"id": "new-pig", "name": "新猪"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    manager = module.RollPigResourceManager()
+
+    manager._merge_with_existing_snapshot(staging_dir)
+
+    legacy_variants = json.loads(
+        staging_dir.joinpath(module.LEGACY_EX_VARIANTS_FILENAME).read_text("utf-8")
+    )
+    assert legacy_variants["pigs"]["old-pig"]["levels"]["2"] == {
+        "image": "old-pig_ex2.png",
+        "analysis": "旧 EX 分析",
+    }
+    assert staging_dir.joinpath("images", "old-pig_ex2.png").is_file()
 
 
 def test_rollpig_private_overlay_adds_pigs_rules_and_image_priority(
@@ -3776,6 +4144,45 @@ def test_rollpig_card_fingerprint_hashes_source_content(monkeypatch, tmp_path):
         resource_version="same-version",
     )
     assert second.card_key != third.card_key
+
+
+def test_rollpig_card_fingerprint_isolates_required_avatar(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    regular_font = tmp_path / "regular.ttf"
+    bold_font = tmp_path / "bold.ttf"
+    regular_font.write_bytes(b"regular")
+    bold_font.write_bytes(b"bold")
+    monkeypatch.setattr(module, "REGULAR_FONT", regular_font)
+    monkeypatch.setattr(module, "BOLD_FONT", bold_font)
+
+    relaxed = module._build_card_fingerprint(
+        {"id": "pig"},
+        None,
+        is_new=False,
+        resource_version="v1",
+        require_avatar=False,
+    )
+    strict = module._build_card_fingerprint(
+        {"id": "pig"},
+        None,
+        is_new=False,
+        resource_version="v1",
+        require_avatar=True,
+    )
+
+    assert relaxed.card_key != strict.card_key
+
+
+@pytest.mark.asyncio
+async def test_rollpig_card_strict_avatar_rejects_missing_image(monkeypatch, tmp_path):
+    module = load_rollpig_card_renderer_module(monkeypatch, tmp_path)
+    with pytest.raises(module.PigCardImageLoadError):
+        await module.render_pig_card_image(
+            {"id": "pig"},
+            None,
+            require_avatar=True,
+            cache_final_card=False,
+        )
 
 
 def test_rollpig_card_disk_cache_prunes_and_rejects_corruption(monkeypatch, tmp_path):

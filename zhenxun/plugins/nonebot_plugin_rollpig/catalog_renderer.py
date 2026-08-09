@@ -19,6 +19,7 @@ from .config import (
     get_catalog_render_timeout,
     get_growth_max_expert_level,
 )
+from .growth import expert_level_from_copies
 from .render_budget import html_render_budget
 from .resource_manager import pig_resource_manager
 from .runtime import ROLLPIG_TIMEZONE, rollpig_today
@@ -72,11 +73,6 @@ def get_harmony_font_faces() -> list[dict[str, str | int]]:
         if font_file.exists():
             faces.append({"weight": weight, "uri": font_file.as_uri()})
     return faces
-
-
-def get_expert_level(copies: int) -> int:
-    """图鉴渲染等级必须与抽猪成长文案保持同一套 copies -> Lv. 规则。"""
-    return min(max(int(copies or 0) - 1, 0), get_growth_max_expert_level())
 
 
 def _catalog_cache_bytes() -> int:
@@ -155,12 +151,12 @@ def _is_recent_new(first_obtained_at: str | None, *, today: datetime.date) -> bo
     return 0 <= (today - obtained_at.date()).days < NEW_BADGE_DAYS
 
 
-def _thumbnail_uri(pig_id: str, image_file: Path) -> str:
+def _thumbnail_uri(pig_id: str, image_file: Path) -> str | None:
     """生成小图缓存；源文件状态进入指纹，资源包更新后旧缩略图自然失效。"""
     try:
         stat = image_file.stat()
     except OSError:
-        return image_file.as_uri()
+        return None
 
     cache_key = hashlib.sha256(
         "|".join(
@@ -188,13 +184,23 @@ def _thumbnail_uri(pig_id: str, image_file: Path) -> str:
             target.write_bytes(output.getvalue())
     except Exception as error:
         logger.warning(f"rollpig 图鉴缩略图生成失败: pig_id={pig_id} error={error}")
-        return image_file.as_uri()
+        return None
     return target.as_uri()
 
 
-def _image_uri(pig_id: str) -> str:
-    image_file = pig_resource_manager.find_image_file(pig_id)
-    return _thumbnail_uri(pig_id, image_file) if image_file else ""
+def _image_uri(pig_data: dict[str, Any], level: int) -> str:
+    pig_id = str(pig_data.get("id") or "")
+    appearance = pig_resource_manager.resolve_pig_appearance(pig_data, level)
+    if appearance.image_path is not None:
+        image_uri = _thumbnail_uri(pig_id, appearance.image_path)
+        if image_uri:
+            return image_uri
+    if (
+        appearance.base_image_path is not None
+        and appearance.base_image_path != appearance.image_path
+    ):
+        return _thumbnail_uri(pig_id, appearance.base_image_path) or ""
+    return ""
 
 
 def _calculate_checkin_streak(
@@ -221,7 +227,7 @@ def _sort_progress_items(draw_state: DrawState) -> list[tuple[str, PigProgress]]
     return sorted(
         draw_state.progress.items(),
         key=lambda item: (
-            -get_expert_level(item[1].copies),
+            -expert_level_from_copies(item[1].copies),
             -int(item[1].copies or 0),
             item[1].first_obtained_at or "",
             resource_order.get(item[0], 10**9),
@@ -270,7 +276,7 @@ def _build_template_payload(
         pig_id = str(pig.get("id") or "")
         progress = progress_map.get(pig_id)
         locked = pig_id not in unlocked_ids or progress is None
-        level = get_expert_level(progress.copies) if progress else 0
+        level = expert_level_from_copies(progress.copies) if progress else 0
         is_max = (not locked) and level >= max_level
         is_new = (not locked) and _is_recent_new(
             progress.first_obtained_at if progress else None,
@@ -287,7 +293,7 @@ def _build_template_payload(
                 "id": pig_id,
                 "index": index,
                 "name": display_name,
-                "image": "" if locked else _image_uri(pig_id),
+                "image": "" if locked else _image_uri(pig, level),
                 "level": level,
                 "level_class": level_class,
                 "copies": int(progress.copies or 0) if progress else 0,
@@ -301,10 +307,10 @@ def _build_template_payload(
     if progress_items:
         favorite_id, favorite_progress = progress_items[0]
         favorite_pig = pig_resource_manager.pig_map.get(favorite_id, {})
-        favorite_level = get_expert_level(favorite_progress.copies)
+        favorite_level = expert_level_from_copies(favorite_progress.copies)
         favorite = {
             "name": str(favorite_pig.get("name") or favorite_id),
-            "image": _image_uri(favorite_id),
+            "image": _image_uri(favorite_pig, favorite_level),
             "level": favorite_level,
             "level_class": _level_class(favorite_level, max_level),
             "copies": int(favorite_progress.copies or 0),
@@ -318,7 +324,9 @@ def _build_template_payload(
             "copies": 0,
         }
 
-    levels = [get_expert_level(progress.copies) for _, progress in progress_items]
+    levels = [
+        expert_level_from_copies(progress.copies) for _, progress in progress_items
+    ]
     progress_percent = (
         round((unlocked / total_pigs) * 100, 1) if total_pigs > 0 else 0.0
     )
@@ -372,6 +380,7 @@ def _build_cache_key(payload: dict[str, Any], snapshot: CatalogSnapshot) -> str:
                 card["copies"],
                 card["is_new"],
                 card["is_max"],
+                card["image"],
             )
             for card in payload["cards"]
         ],

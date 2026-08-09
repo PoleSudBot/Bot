@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import time
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urljoin
 
@@ -34,7 +35,9 @@ PLUGIN_DIR = Path(__file__).parent
 BUILTIN_RESOURCE_DIR = PLUGIN_DIR / "resource"
 BUILTIN_PIG_JSON = BUILTIN_RESOURCE_DIR / "pig.json"
 BUILTIN_RULES_JSON = BUILTIN_RESOURCE_DIR / "pig_rules.json"
+BUILTIN_EX_VARIANTS_JSON = BUILTIN_RESOURCE_DIR / "pig_ex_variants.json"
 BUILTIN_IMAGE_DIR = BUILTIN_RESOURCE_DIR / "image"
+LEGACY_EX_VARIANTS_FILENAME = "pig_ex_variants_legacy.json"
 
 CACHE_ROOT = localstore.get_plugin_data_dir() / "resources"
 ACTIVE_RESOURCE_DIR = CACHE_ROOT / "active"
@@ -50,6 +53,13 @@ PRIVATE_OVERLAY_ROOT = CACHE_ROOT / "private_overlays"
 PIG_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 IMAGE_SUFFIX_PRIORITY = (".gif", ".png", ".webp", ".jpg", ".jpeg")
 ALLOWED_IMAGE_SUFFIXES = set(IMAGE_SUFFIX_PRIORITY)
+VARIANT_IMAGE_MANIFEST_FIELDS = frozenset(
+    {"pig_id", "level", "filename", "path", "size", "sha256"}
+)
+RESOURCE_EX_VARIANTS_JSON_MAX_SIZE = 512 * 1024
+RESOURCE_MAX_EX_VARIANTS = 500
+RESOURCE_MAX_VARIANT_IMAGES = 500
+RESOURCE_MAX_VARIANT_LEVEL = 5
 IMAGE_FORMAT_SUFFIXES = {
     "GIF": {".gif"},
     "JPEG": {".jpg", ".jpeg"},
@@ -63,6 +73,14 @@ RULE_KEYS = (
     "sold_pigs",
     "roast_excluded_pigs",
 )
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 @dataclass
@@ -91,6 +109,34 @@ class ResourceOverlaySource:
     active_dir: Path
     previous_dir: Path
     state_file: Path
+
+
+@dataclass(frozen=True)
+class _PigExVariantSpec:
+    pig_id: str
+    level: int
+    filename: str | None = None
+    description: str | None = None
+    analysis: str | None = None
+
+
+@dataclass(frozen=True)
+class PigExVariant:
+    pig_id: str
+    level: int
+    image_path: Path | None = None
+    description: str | None = None
+    analysis: str | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedPigAppearance:
+    pig_data: dict[str, Any]
+    image_path: Path | None
+    base_image_path: Path | None
+    requested_level: int
+    applied_level: int
+    resource_version: str
 
 
 def _resource_overlay_sources() -> list[ResourceOverlaySource]:
@@ -148,6 +194,8 @@ class RollPigResourceManager:
         self.pig_map: dict[str, dict[str, Any]] = {}
         self.rules: dict[str, list[str]] = {}
         self.image_dirs: list[Path] = []
+        self.ex_variants: dict[str, dict[int, PigExVariant]] = {}
+        self.variant_blocked_pig_ids: set[str] = set()
         self.resource_version = "builtin"
 
     def reload(self) -> None:
@@ -187,6 +235,22 @@ class RollPigResourceManager:
         self.pig_map = {str(item["id"]): item for item in pig_list}
         self.rules = rules
         self.image_dirs = image_dirs
+        legacy_variants = self._load_ex_variants(
+            resource_dir / LEGACY_EX_VARIANTS_FILENAME,
+            pig_ids={str(item["id"]) for item in pig_list},
+            image_dir=image_dirs[0],
+            strict=False,
+        )
+        current_variants = self._load_ex_variants(
+            resource_dir / "pig_ex_variants.json",
+            pig_ids={str(item["id"]) for item in pig_list},
+            image_dir=image_dirs[0],
+            strict=False,
+        )
+        for pig_id, levels in current_variants.items():
+            legacy_variants.setdefault(pig_id, {}).update(levels)
+        self.ex_variants = legacy_variants
+        self.variant_blocked_pig_ids = set()
         self.resource_version = resource_version or "cache"
         logger.info(
             f"rollpig 资源已加载: version={self.resource_version}, pigs={len(pig_list)}"
@@ -238,6 +302,7 @@ class RollPigResourceManager:
             )
 
         merged_map = {pig_id: dict(item) for pig_id, item in self.pig_map.items()}
+        overridden_ids: set[str] = set()
         for override in pig_overrides:
             pig_id = str(override["id"])
             if pig_id not in merged_map:
@@ -248,6 +313,7 @@ class RollPigResourceManager:
             )
             updated_item["id"] = pig_id
             merged_map[pig_id] = updated_item
+            overridden_ids.add(pig_id)
 
         merged_pigs = [merged_map[str(item["id"])] for item in self.pig_list]
         merged_pigs.extend(private_pigs)
@@ -256,6 +322,7 @@ class RollPigResourceManager:
         self.pig_map = {str(item["id"]): item for item in merged_pigs}
         self.rules = self._merge_rules(private_rules, self.rules)
         self.image_dirs = [resource_dir / "images", *self.image_dirs]
+        self.variant_blocked_pig_ids.update(overridden_ids)
         self.resource_version = (
             f"{self.resource_version}+{resource_version or 'private'}"
         )
@@ -276,6 +343,89 @@ class RollPigResourceManager:
                 if image_file.exists():
                     return image_file
         return None
+
+    def resolve_pig_appearance(
+        self,
+        pig_data: Mapping[str, Any],
+        ex_level: int,
+    ) -> ResolvedPigAppearance:
+        resolved_data = dict(pig_data)
+        pig_id = str(resolved_data.get("id") or "")
+        requested_level = min(
+            max(int(ex_level or 0), 0),
+            RESOURCE_MAX_VARIANT_LEVEL,
+        )
+        base_image_path = self.find_image_file(pig_id) if pig_id else None
+        image_path = base_image_path
+        applied_level = 0
+
+        if pig_id and pig_id not in self.variant_blocked_pig_ids:
+            for candidate_level in range(1, requested_level + 1):
+                variant = self.ex_variants.get(pig_id, {}).get(candidate_level)
+                if variant is None:
+                    continue
+                if variant.image_path is not None and (
+                    not variant.image_path.is_file() or variant.image_path.is_symlink()
+                ):
+                    logger.warning(
+                        "rollpig EX 差分图片运行时缺失，已跳过该等级: "
+                        f"pig_id={pig_id} level={candidate_level} "
+                        f"file={variant.image_path}"
+                    )
+                    continue
+                if variant.image_path is not None:
+                    image_path = variant.image_path
+                if variant.description is not None:
+                    resolved_data["description"] = variant.description
+                if variant.analysis is not None:
+                    resolved_data["analysis"] = variant.analysis
+                applied_level = candidate_level
+
+        return ResolvedPigAppearance(
+            pig_data=resolved_data,
+            image_path=image_path,
+            base_image_path=base_image_path,
+            requested_level=requested_level,
+            applied_level=applied_level,
+            resource_version=self.resource_version,
+        )
+
+    def available_variant_levels(self, pig_id: str) -> tuple[int, ...]:
+        if not pig_id or pig_id in self.variant_blocked_pig_ids:
+            return ()
+        return tuple(sorted(self.ex_variants.get(pig_id, {})))
+
+    def newly_unlocked_variant_levels(
+        self,
+        pig_id: str,
+        previous_level: int,
+        current_level: int,
+    ) -> tuple[int, ...]:
+        previous = min(max(int(previous_level or 0), 0), RESOURCE_MAX_VARIANT_LEVEL)
+        current = min(max(int(current_level or 0), 0), RESOURCE_MAX_VARIANT_LEVEL)
+        if current <= previous:
+            return ()
+        return tuple(
+            level
+            for level in self.available_variant_levels(pig_id)
+            if previous < level <= current
+        )
+
+    def variant_change_fields(self, pig_id: str, level: int) -> frozenset[str]:
+        if not pig_id or pig_id in self.variant_blocked_pig_ids:
+            return frozenset()
+        variant = self.ex_variants.get(pig_id, {}).get(int(level or 0))
+        if variant is None:
+            return frozenset()
+
+        fields: set[str] = set()
+        if variant.image_path is not None:
+            if not variant.image_path.is_file() or variant.image_path.is_symlink():
+                return frozenset()
+            fields.add("image")
+        if variant.description is not None or variant.analysis is not None:
+            fields.add("text")
+        return frozenset(fields)
 
     def get_rule_ids(self, key: str) -> list[str]:
         return list(self.rules.get(key, []))
@@ -361,7 +511,11 @@ class RollPigResourceManager:
             resource_version = str(manifest.get("resource_version") or "").strip()
             if not resource_version:
                 raise ValueError("manifest 缺少 resource_version")
-            if not force and resource_version == self._read_state_version():
+            if (
+                not force
+                and resource_version == self._read_state_version()
+                and self._active_variant_assets_complete(manifest)
+            ):
                 return ResourceSyncResult(
                     updated=False,
                     skipped=True,
@@ -551,10 +705,10 @@ class RollPigResourceManager:
         )
 
         optional_files = manifest.get("optional_files") or {}
+        if not isinstance(optional_files, dict):
+            raise ValueError("manifest optional_files 必须是 object")
         rules_meta = (
             optional_files.get("pig_rules")
-            if isinstance(optional_files, dict)
-            else None
         )
         if isinstance(rules_meta, dict):
             await self._download_file_by_meta(
@@ -563,6 +717,31 @@ class RollPigResourceManager:
                 meta=rules_meta,
                 target=staging_dir / "pig_rules.json",
                 max_size=max_size,
+            )
+
+        pig_list = self._read_pig_json(staging_dir / "pig.json")
+        pig_ids = {str(item["id"]) for item in pig_list}
+        variant_specs: dict[tuple[str, int], _PigExVariantSpec] = {}
+        variants_meta = optional_files.get("pig_ex_variants")
+        if "pig_ex_variants" in optional_files:
+            if not isinstance(variants_meta, dict):
+                raise ValueError("optional_files.pig_ex_variants 必须是 object")
+            self._validate_required_manifest_meta(
+                variants_meta,
+                label="optional_files.pig_ex_variants",
+                expected_path="pig_ex_variants.json",
+            )
+            await self._download_file_by_meta(
+                client,
+                manifest_url=manifest_url,
+                meta=variants_meta,
+                target=staging_dir / "pig_ex_variants.json",
+                max_size=min(max_size, RESOURCE_EX_VARIANTS_JSON_MAX_SIZE),
+            )
+            variant_specs = self._read_ex_variant_specs(
+                staging_dir / "pig_ex_variants.json",
+                pig_ids=pig_ids,
+                strict=True,
             )
 
         image_items = manifest.get("images") or []
@@ -592,6 +771,71 @@ class RollPigResourceManager:
                     max_size=max_size,
                 )
             )
+
+        image_variant_specs = {
+            key: spec.filename
+            for key, spec in variant_specs.items()
+            if spec.filename is not None
+        }
+        raw_variant_items = manifest.get("variant_images", [])
+        if not isinstance(raw_variant_items, list):
+            raise ValueError("manifest variant_images 必须是 list")
+        if len(raw_variant_items) > RESOURCE_MAX_VARIANT_IMAGES:
+            raise ValueError(
+                "manifest variant_images 数量超过上限: "
+                f"{len(raw_variant_items)}/{RESOURCE_MAX_VARIANT_IMAGES}"
+            )
+        if raw_variant_items and not isinstance(variants_meta, dict):
+            raise ValueError(
+                "manifest 声明了 variant_images，但缺少 pig_ex_variants.json"
+            )
+
+        seen_variant_keys: set[tuple[str, int]] = set()
+        for index, image_meta in enumerate(raw_variant_items):
+            if not isinstance(image_meta, dict):
+                raise ValueError(f"manifest variant_images[{index}] 必须是 object")
+            unknown_fields = sorted(set(image_meta) - VARIANT_IMAGE_MANIFEST_FIELDS)
+            if unknown_fields:
+                raise ValueError(
+                    f"manifest variant_images[{index}] 含未支持字段: "
+                    + ", ".join(unknown_fields)
+                )
+            pig_id = str(image_meta.get("pig_id") or "")
+            raw_level = image_meta.get("level")
+            if isinstance(raw_level, bool) or not isinstance(raw_level, int):
+                raise ValueError(f"manifest variant_images[{index}].level 必须是整数")
+            level = int(raw_level)
+            filename = str(image_meta.get("filename") or "")
+            self._validate_variant_image_filename(
+                filename,
+                pig_id=pig_id,
+                level=level,
+            )
+            self._validate_required_manifest_meta(
+                image_meta,
+                label=f"variant_images[{index}]",
+                expected_path=f"images/{filename}",
+            )
+            key = (pig_id, level)
+            if key in seen_variant_keys:
+                raise ValueError(f"manifest 重复声明差分图片: {pig_id}/EX{level}")
+            seen_variant_keys.add(key)
+            if image_variant_specs.get(key) != filename:
+                raise ValueError(f"manifest 差分图片未与 JSON 对应: {pig_id}/EX{level}")
+            target = staging_dir / "images" / filename
+            await self._download_file_by_meta(
+                client,
+                manifest_url=manifest_url,
+                meta=image_meta,
+                target=target,
+                max_size=max_size,
+            )
+            self._validate_image_content(target.read_bytes(), target.suffix)
+
+        missing_variant_images = sorted(set(image_variant_specs) - seen_variant_keys)
+        if missing_variant_images:
+            pig_id, level = missing_variant_images[0]
+            raise ValueError(f"差分 JSON 引用的图片未写入 manifest: {pig_id}/EX{level}")
         return image_report
 
     async def _download_private_manifest_files(
@@ -617,6 +861,14 @@ class RollPigResourceManager:
         optional_files = manifest.get("optional_files") or {}
         if not isinstance(optional_files, dict):
             raise ValueError("私有资源 optional_files 必须是 object")
+        if optional_files.get("pig_ex_variants") is not None:
+            raise ValueError("当前版本暂不支持私有 Overlay 提供 EX 等级差分")
+        private_variant_images = manifest.get("variant_images")
+        if private_variant_images is not None:
+            if not isinstance(private_variant_images, list):
+                raise ValueError("私有资源 variant_images 必须是 list 或 null")
+            if private_variant_images:
+                raise ValueError("当前版本暂不支持私有 Overlay 提供 EX 等级差分")
         for key, filename in (
             ("pig_rules", "pig_rules.json"),
             ("pig_overrides", "pig_overrides.json"),
@@ -683,6 +935,11 @@ class RollPigResourceManager:
             new_pigs=new_pigs,
             merged_pigs=merged_pigs,
             base_image_dirs=base_image_dirs,
+        )
+        self._preserve_legacy_variants(
+            staging_dir,
+            new_pig_ids={str(item["id"]) for item in new_pigs},
+            merged_pig_ids={str(item["id"]) for item in merged_pigs},
         )
 
         (staging_dir / "pig.json").write_text(
@@ -760,6 +1017,74 @@ class RollPigResourceManager:
             target = target_image_dir / source.name
             if not target.exists():
                 shutil.copy2(source, target)
+
+    def _preserve_legacy_variants(
+        self,
+        staging_dir: Path,
+        *,
+        new_pig_ids: set[str],
+        merged_pig_ids: set[str],
+    ) -> None:
+        legacy_pig_ids = merged_pig_ids - new_pig_ids
+        if not legacy_pig_ids:
+            return
+
+        sources = [
+            (
+                BUILTIN_EX_VARIANTS_JSON,
+                BUILTIN_IMAGE_DIR,
+            ),
+            (
+                ACTIVE_RESOURCE_DIR / LEGACY_EX_VARIANTS_FILENAME,
+                ACTIVE_IMAGE_DIR,
+            ),
+            (
+                ACTIVE_RESOURCE_DIR / "pig_ex_variants.json",
+                ACTIVE_IMAGE_DIR,
+            ),
+        ]
+        preserved: dict[tuple[str, int], _PigExVariantSpec] = {}
+        source_dirs: dict[tuple[str, int], Path] = {}
+        for variants_path, image_dir in sources:
+            specs = self._read_ex_variant_specs(
+                variants_path,
+                pig_ids=merged_pig_ids,
+                strict=False,
+            )
+            for key, spec in specs.items():
+                if spec.pig_id not in legacy_pig_ids:
+                    continue
+                preserved[key] = spec
+                source_dirs[key] = image_dir
+
+        if not preserved:
+            return
+
+        payload: dict[str, Any] = {"schema_version": 1, "pigs": {}}
+        for key, spec in sorted(preserved.items()):
+            level_data: dict[str, str] = {}
+            if spec.filename is not None:
+                source = source_dirs[key] / spec.filename
+                if not source.is_file() or source.is_symlink():
+                    continue
+                target = staging_dir / "images" / spec.filename
+                if not target.exists():
+                    shutil.copy2(source, target)
+                level_data["image"] = spec.filename
+            if spec.description is not None:
+                level_data["description"] = spec.description
+            if spec.analysis is not None:
+                level_data["analysis"] = spec.analysis
+            if not level_data:
+                continue
+            pig_entry = payload["pigs"].setdefault(spec.pig_id, {"levels": {}})
+            pig_entry["levels"][str(spec.level)] = level_data
+
+        if payload["pigs"]:
+            (staging_dir / LEGACY_EX_VARIANTS_FILENAME).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     def _find_image_in_dirs(self, pig_id: str, image_dirs: list[Path]) -> Path | None:
         for image_dir in image_dirs:
@@ -942,6 +1267,90 @@ class RollPigResourceManager:
         except Exception:
             return "cache"
 
+    def _active_variant_assets_complete(self, manifest: Mapping[str, Any]) -> bool:
+        optional_files = manifest.get("optional_files") or {}
+        raw_variant_items = manifest.get("variant_images", [])
+        if not isinstance(optional_files, dict) or not isinstance(
+            raw_variant_items, list
+        ):
+            return False
+        variants_meta = optional_files.get("pig_ex_variants")
+        if variants_meta is None and not raw_variant_items:
+            return True
+        if not isinstance(variants_meta, dict):
+            return False
+        try:
+            self._validate_required_manifest_meta(
+                variants_meta,
+                label="optional_files.pig_ex_variants",
+                expected_path="pig_ex_variants.json",
+            )
+            if not self._local_file_matches_meta(
+                ACTIVE_RESOURCE_DIR / "pig_ex_variants.json",
+                variants_meta,
+            ):
+                return False
+            pig_ids = {
+                str(item["id"])
+                for item in self._read_pig_json(ACTIVE_RESOURCE_DIR / "pig.json")
+            }
+            specs = self._read_ex_variant_specs(
+                ACTIVE_RESOURCE_DIR / "pig_ex_variants.json",
+                pig_ids=pig_ids,
+                strict=True,
+            )
+            expected_images = {
+                key: spec.filename
+                for key, spec in specs.items()
+                if spec.filename is not None
+            }
+            seen_keys: set[tuple[str, int]] = set()
+            for index, image_meta in enumerate(raw_variant_items):
+                if not isinstance(image_meta, dict):
+                    return False
+                pig_id = str(image_meta.get("pig_id") or "")
+                level = image_meta.get("level")
+                if isinstance(level, bool) or not isinstance(level, int):
+                    return False
+                filename = str(image_meta.get("filename") or "")
+                self._validate_variant_image_filename(
+                    filename,
+                    pig_id=pig_id,
+                    level=level,
+                )
+                self._validate_required_manifest_meta(
+                    image_meta,
+                    label=f"variant_images[{index}]",
+                    expected_path=f"images/{filename}",
+                )
+                key = (pig_id, level)
+                if key in seen_keys or expected_images.get(key) != filename:
+                    return False
+                seen_keys.add(key)
+                if not self._local_file_matches_meta(
+                    ACTIVE_IMAGE_DIR / filename,
+                    image_meta,
+                ):
+                    return False
+            return set(expected_images) == seen_keys
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _local_file_matches_meta(
+        self,
+        path: Path,
+        meta: Mapping[str, Any],
+    ) -> bool:
+        if not path.is_file() or path.is_symlink():
+            return False
+        expected_size = meta.get("size")
+        expected_hash = meta.get("sha256")
+        if expected_size is not None and path.stat().st_size != int(expected_size):
+            return False
+        if expected_hash:
+            return _hash_file(path) == str(expected_hash).lower()
+        return True
+
     def _read_private_state_version(
         self,
         source: ResourceOverlaySource | None = None,
@@ -1024,6 +1433,196 @@ class RollPigResourceManager:
             seen_ids.add(pig_id)
         return data
 
+    def _report_variant_problem(
+        self,
+        path: Path,
+        message: str,
+        *,
+        strict: bool,
+    ) -> None:
+        if strict:
+            raise ValueError(message)
+        logger.warning(f"rollpig EX 差分已忽略: file={path} error={message}")
+
+    def _read_ex_variant_specs(
+        self,
+        path: Path,
+        *,
+        pig_ids: set[str],
+        strict: bool,
+    ) -> dict[tuple[str, int], _PigExVariantSpec]:
+        if not path.exists():
+            return {}
+        try:
+            if path.is_symlink():
+                raise ValueError("pig_ex_variants.json 不能是符号链接")
+            if path.stat().st_size > RESOURCE_EX_VARIANTS_JSON_MAX_SIZE:
+                raise ValueError("pig_ex_variants.json 超过大小上限")
+            data = json.loads(self._read_json_text(path))
+        except Exception as error:
+            self._report_variant_problem(path, str(error), strict=strict)
+            return {}
+
+        if not isinstance(data, dict) or data.get("schema_version") != 1:
+            self._report_variant_problem(
+                path,
+                "pig_ex_variants.json 必须是 schema_version=1 的 object",
+                strict=strict,
+            )
+            return {}
+        unknown_root_fields = sorted(set(data) - {"schema_version", "pigs"})
+        if unknown_root_fields:
+            self._report_variant_problem(
+                path,
+                "pig_ex_variants.json 含未支持字段: "
+                + ", ".join(unknown_root_fields),
+                strict=strict,
+            )
+            if not strict:
+                return {}
+        raw_pigs = data.get("pigs")
+        if not isinstance(raw_pigs, dict):
+            self._report_variant_problem(
+                path,
+                "pig_ex_variants.pigs 必须是 object",
+                strict=strict,
+            )
+            return {}
+
+        specs: dict[tuple[str, int], _PigExVariantSpec] = {}
+        for raw_pig_id, raw_pig in raw_pigs.items():
+            pig_id = str(raw_pig_id)
+            if not PIG_ID_PATTERN.fullmatch(pig_id) or pig_id not in pig_ids:
+                self._report_variant_problem(
+                    path,
+                    f"差分指向不存在或非法的小猪 ID: {pig_id}",
+                    strict=strict,
+                )
+                continue
+            if not isinstance(raw_pig, dict) or set(raw_pig) != {"levels"}:
+                self._report_variant_problem(
+                    path,
+                    f"差分猪条目只能包含 levels: {pig_id}",
+                    strict=strict,
+                )
+                continue
+            raw_levels = raw_pig.get("levels")
+            if not isinstance(raw_levels, dict) or not raw_levels:
+                self._report_variant_problem(
+                    path,
+                    f"差分猪 {pig_id}.levels 必须是非空 object",
+                    strict=strict,
+                )
+                continue
+            for raw_level, raw_variant in raw_levels.items():
+                if (
+                    not isinstance(raw_level, str)
+                    or not raw_level.isdigit()
+                    or not 1 <= int(raw_level) <= RESOURCE_MAX_VARIANT_LEVEL
+                ):
+                    self._report_variant_problem(
+                        path,
+                        f"差分等级非法: {pig_id}/{raw_level}",
+                        strict=strict,
+                    )
+                    continue
+                level = int(raw_level)
+                if not isinstance(raw_variant, dict):
+                    self._report_variant_problem(
+                        path,
+                        f"差分等级条目必须是 object: {pig_id}/EX{level}",
+                        strict=strict,
+                    )
+                    continue
+                unknown_fields = sorted(
+                    set(raw_variant) - {"image", "description", "analysis"}
+                )
+                if unknown_fields or not raw_variant:
+                    self._report_variant_problem(
+                        path,
+                        f"差分 {pig_id}/EX{level} 字段非法",
+                        strict=strict,
+                    )
+                    continue
+
+                filename: str | None = None
+                if "image" in raw_variant:
+                    raw_filename = raw_variant.get("image")
+                    try:
+                        self._validate_variant_image_filename(
+                            raw_filename,
+                            pig_id=pig_id,
+                            level=level,
+                        )
+                    except ValueError as error:
+                        self._report_variant_problem(path, str(error), strict=strict)
+                        continue
+                    filename = str(raw_filename)
+
+                text_values: dict[str, str | None] = {}
+                invalid_text = False
+                for field in ("description", "analysis"):
+                    value = raw_variant.get(field)
+                    if field in raw_variant and (
+                        not isinstance(value, str) or not value.strip()
+                    ):
+                        self._report_variant_problem(
+                            path,
+                            f"差分 {pig_id}/EX{level}.{field} 必须是非空字符串",
+                            strict=strict,
+                        )
+                        invalid_text = True
+                        break
+                    text_values[field] = value if isinstance(value, str) else None
+                if invalid_text:
+                    continue
+                specs[(pig_id, level)] = _PigExVariantSpec(
+                    pig_id=pig_id,
+                    level=level,
+                    filename=filename,
+                    description=text_values["description"],
+                    analysis=text_values["analysis"],
+                )
+                if len(specs) > RESOURCE_MAX_EX_VARIANTS:
+                    self._report_variant_problem(
+                        path,
+                        "差分条目数量超过上限: "
+                        f"{len(specs)}/{RESOURCE_MAX_EX_VARIANTS}",
+                        strict=strict,
+                    )
+                    return {}
+        return specs
+
+    def _load_ex_variants(
+        self,
+        path: Path,
+        *,
+        pig_ids: set[str],
+        image_dir: Path,
+        strict: bool,
+    ) -> dict[str, dict[int, PigExVariant]]:
+        specs = self._read_ex_variant_specs(path, pig_ids=pig_ids, strict=strict)
+        variants: dict[str, dict[int, PigExVariant]] = {}
+        for spec in specs.values():
+            image_path = image_dir / spec.filename if spec.filename else None
+            if image_path is not None and (
+                not image_path.is_file() or image_path.is_symlink()
+            ):
+                self._report_variant_problem(
+                    path,
+                    f"差分图片不存在或非法: {spec.filename}",
+                    strict=strict,
+                )
+                continue
+            variants.setdefault(spec.pig_id, {})[spec.level] = PigExVariant(
+                pig_id=spec.pig_id,
+                level=spec.level,
+                image_path=image_path,
+                description=spec.description,
+                analysis=spec.analysis,
+            )
+        return variants
+
     def _normalize_rules(self, rules: dict[str, Any]) -> dict[str, list[str]]:
         normalized: dict[str, list[str]] = {}
         for key in RULE_KEYS:
@@ -1063,6 +1662,50 @@ class RollPigResourceManager:
             raise ValueError(f"不支持的图片格式: {filename}")
         if not PIG_ID_PATTERN.match(path.stem):
             raise ValueError(f"图片文件名非法: {filename}")
+
+    def _validate_variant_image_filename(
+        self,
+        filename: Any,
+        *,
+        pig_id: str,
+        level: int,
+    ) -> None:
+        if not isinstance(filename, str) or not filename:
+            raise ValueError(f"差分 {pig_id}/EX{level} 缺少 image")
+        if (
+            not PIG_ID_PATTERN.fullmatch(pig_id)
+            or not 1 <= level <= RESOURCE_MAX_VARIANT_LEVEL
+        ):
+            raise ValueError(f"差分图片的猪 ID 或等级非法: {pig_id}/EX{level}")
+        path = Path(filename)
+        if path.name != filename or "\\" in filename:
+            raise ValueError(f"差分图片文件名不能包含路径: {filename}")
+        if (
+            path.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES
+            or path.suffix != path.suffix.lower()
+        ):
+            raise ValueError(f"差分图片格式不受支持: {filename}")
+        if path.stem != f"{pig_id}_ex{level}":
+            raise ValueError(
+                f"差分图片文件名必须为 {pig_id}_ex{level}.png 或 .gif: {filename}"
+            )
+
+    def _validate_required_manifest_meta(
+        self,
+        meta: Mapping[str, Any],
+        *,
+        label: str,
+        expected_path: str,
+    ) -> None:
+        path = str(meta.get("path") or "")
+        if path != expected_path:
+            raise ValueError(f"{label}.path 必须为 {expected_path}")
+        sha256 = str(meta.get("sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError(f"{label}.sha256 必须是 64 位小写十六进制")
+        size = meta.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"{label}.size 必须是非负整数")
 
     def _build_sync_message(
         self,

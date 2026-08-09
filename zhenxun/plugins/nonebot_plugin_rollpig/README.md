@@ -15,6 +15,8 @@
 ## 成长系统
 
 - 每只猪都有累计抽到次数 `copies`，`1` 次为 `Lv.0`，之后每多一次提升一级，默认最高 `Lv.5`。
+- 公有资源包可为 `EX1`～`EX5` 提供稀疏差分图片、描述与分析；今日小猪和个人图鉴会按当前等级逐档继承，损坏差分自动回退基础形象。
+- `GROWTH_MAX_EXPERT_LEVEL` 仍控制本地成长等级；配置高于 `5` 时可继续升级，但资源协议暂不应用 `EX5` 以上差分。
 - 重复抽到已解锁小猪会增加 `duplicate_streak`，下一次未解锁小猪的抽取权重会随连续重复次数提高。
 - 抽到新猪后 `duplicate_streak` 清零，并写入图鉴；同一天重复查看不会刷等级或连续重复次数。
 - 旧账本迁移时只能确认“曾经拥有过”，因此历史图鉴统一回填为 `copies=1`，不会伪造历史重复次数。
@@ -61,7 +63,7 @@
 `我的猪圈` 与 `小猪图鉴` 系列别名会生成同一张全量展柜图鉴；所有小猪按当前运行资源顺序固定展示，已获得小猪亮相，未解锁小猪以锁定占位显示。
 
 - 图片命令只支持本地账册模式，不新增云中心接口。
-- 图鉴卡片会展示缩略图、名称、`Lv.`、累计次数，以及最近 7 个业务日获得的新猪贴纸。
+- 图鉴卡片会展示当前 EX 差分缩略图、名称、`Lv.`、累计次数，以及最近 7 个业务日获得的新猪贴纸。
 - 等级使用低饱和颜色和字重区分：低等级偏灰，高等级偏紫/红紫；不再单独展示“最高等级”或分页信息。
 - 顶部会展示收集进度、黑白进度条、当前群猪猪排名和本地总排名。
 - 缩略图从当前 active/private/builtin 资源快照读取并缓存到 localstore cache；命令执行时不会临时远程拉图，缺图会显示占位。
@@ -76,7 +78,7 @@
 
 资源同步只处理静态资源，不接入上游 rollpig 云端账本，也不会读写本地 `pig_data.json`。
 
-- manifest 指向一组静态文件：`pig.json`、可选 `pig_rules.json`、以及小猪图片。
+- manifest 指向一组静态文件：`pig.json`、可选 `pig_rules.json` / `pig_ex_variants.json`、基础图片和 EX 差分图片。
 - 同步成功前写入 localstore 缓存目录，完整校验后再替换 active 快照；失败会继续使用旧缓存或内置元数据。
 - 启动同步、定时同步和手动同步共用同一把同步锁；手动同步会等待当前任务，后台同步遇到已有任务时直接跳过。
 - Bot 关闭时会取消并等待后台资源同步任务，避免退出过程中仍在替换缓存目录。
@@ -88,6 +90,7 @@
 - 资源覆盖顺序为内置、公有、官方 GIF、旧私有包、`PRIVATE_RESOURCE_MANIFESTS`；同一包内优先使用 GIF，图片版图鉴固定读取 GIF 首帧。
 - 额外资源包分别缓存到 `resources/private_overlays/<name>/`，单包同步失败不会阻断其它包更新。
 - 私有 `pig.json` 默认只追加新 ID；如需覆盖公有小猪文案，必须通过 `pig_overrides.json` 显式声明。
+- 首版 EX 差分只接受公有资源包；私有 overlay 的 `pig_ex_variants` 必须省略或为 `null`，`variant_images` 只能省略、为 `null` 或空列表。私有 overlay 覆盖某个公有 ID 后，该 ID 的公有差分会停用。
 - 本地特色的 `new.png` 贴纸位于 `resource/assets/new.png`，不属于小猪图片同步范围。
 
 额外资源包配置示例：
@@ -109,11 +112,42 @@ manifest 示例：
   "resource_version": "2026-06-21",
   "pig_json": {"path": "pig.json", "sha256": "..."},
   "optional_files": {
-    "pig_rules": {"path": "pig_rules.json", "sha256": "..."}
+    "pig_rules": {"path": "pig_rules.json", "sha256": "..."},
+    "pig_ex_variants": {
+      "path": "pig_ex_variants.json",
+      "size": 1234,
+      "sha256": "..."
+    }
   },
   "images": [
     {"path": "images/pig.png", "filename": "pig.png", "sha256": "..."}
+  ],
+  "variant_images": [
+    {
+      "pig_id": "pig",
+      "level": 2,
+      "path": "images/pig_ex2.png",
+      "filename": "pig_ex2.png",
+      "size": 5678,
+      "sha256": "..."
+    }
   ]
+}
+```
+
+`pig_ex_variants.json` 使用 `schema_version: 1`，按猪 ID 和等级声明差分；每档至少包含 `image`、`description`、`analysis` 之一：
+
+```json
+{
+  "schema_version": 1,
+  "pigs": {
+    "pig": {
+      "levels": {
+        "1": {"description": "EX1 的新描述"},
+        "2": {"image": "pig_ex2.png", "analysis": "EX2 的新分析"}
+      }
+    }
+  }
 }
 ```
 

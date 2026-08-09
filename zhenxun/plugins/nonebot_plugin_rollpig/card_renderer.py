@@ -66,6 +66,10 @@ class PigCardRenderResult:
     renderer: Literal["pillow", "pillow-gif"]
 
 
+class PigCardImageLoadError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class _PreparedCard:
     canvas: Image.Image
@@ -511,14 +515,24 @@ def _render_sync(
     *,
     is_new: bool,
     source_key: str | None,
+    require_avatar: bool,
 ) -> PigCardRenderResult:
+    if require_avatar and image_file is None:
+        raise PigCardImageLoadError("required avatar is missing")
     prepared = _prepare_card(pig_data)
     gif_frames: list[tuple[Image.Image, int]] = []
     try:
         gif_frames = _load_gif_frames(image_file, source_key)
         if gif_frames:
             return _encode_gif(prepared, gif_frames, is_new=is_new)
-        return _encode_png(prepared, image_file, is_new=is_new)
+        try:
+            return _encode_png(prepared, image_file, is_new=is_new)
+        except Exception as error:
+            if require_avatar:
+                raise PigCardImageLoadError(
+                    "required avatar cannot be decoded"
+                ) from error
+            raise
     finally:
         _close_frames(gif_frames)
         prepared.canvas.close()
@@ -567,6 +581,7 @@ def _build_card_fingerprint(
     *,
     is_new: bool,
     resource_version: str,
+    require_avatar: bool = False,
 ) -> _CardFingerprint:
     source = _source_signature(image_file)
     payload = {
@@ -586,6 +601,7 @@ def _build_card_fingerprint(
             for key in ("id", "name", "description", "analysis")
         },
         "is_new": is_new,
+        "require_avatar": require_avatar,
         "resource_version": str(resource_version or ""),
         "source": source,
         "fonts": [
@@ -756,6 +772,7 @@ async def _render_card_once(
     image_file: Path | None,
     *,
     is_new: bool,
+    require_avatar: bool,
     resource_version: str,
     fingerprint: _CardFingerprint,
     cache_final_card: bool,
@@ -768,6 +785,7 @@ async def _render_card_once(
             image_file,
             is_new=is_new,
             source_key=fingerprint.source_key,
+            require_avatar=require_avatar,
         )
 
     if image_file is not None and image_file.suffix.lower() == ".gif":
@@ -782,6 +800,7 @@ async def _render_card_once(
             pig_data,
             image_file,
             is_new=is_new,
+            require_avatar=require_avatar,
             resource_version=resource_version,
         )
         if fresh_fingerprint.card_key == fingerprint.card_key:
@@ -822,6 +841,7 @@ async def render_pig_card_image(
     image_file: Path | None,
     *,
     is_new: bool = False,
+    require_avatar: bool = False,
     cache_final_card: bool = True,
     resource_version: str = "",
 ) -> PigCardRenderResult:
@@ -832,6 +852,7 @@ async def render_pig_card_image(
         pig_data,
         image_file,
         is_new=is_new,
+        require_avatar=require_avatar,
         resource_version=resource_version,
     )
     max_cache_bytes = get_card_disk_cache_max_bytes()
@@ -854,6 +875,7 @@ async def render_pig_card_image(
                 pig_data,
                 image_file,
                 is_new=is_new,
+                require_avatar=require_avatar,
                 resource_version=resource_version,
                 fingerprint=fingerprint,
                 cache_final_card=cache_final_card,

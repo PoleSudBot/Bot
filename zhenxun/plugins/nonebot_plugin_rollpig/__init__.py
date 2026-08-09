@@ -55,6 +55,7 @@ from .card_renderer import (
     shutdown_card_renderer,
 )
 from .render_budget import html_render_budget
+from .growth import expert_level_from_copies
 from .resource_manager import pig_resource_manager
 from .roast_manager import roast_manager
 from .runtime import (
@@ -75,6 +76,7 @@ from .texts import (
     DAILY_ROLL_DUPLICATE_LEVEL_UP_TEXTS,
     DAILY_ROLL_DUPLICATE_SAME_LEVEL_TEXTS,
     DAILY_ROLL_NEW_PIG_TEXTS,
+    DAILY_ROLL_VARIANT_LEVEL_UP_TEXTS,
     DAILY_SUMMARY_EMPTY_TEXTS, DAILY_SUMMARY_HEADER, DAILY_SUMMARY_FOOTER,
     EATEN_PIG_ID, SOLD_PIG_ID,
     ESCAPE_TEXTS,
@@ -139,7 +141,7 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
     extra={
         "author": "Felis2026",
-        "version": "0.7.6",
+        "version": "0.8.0",
         "configs": [
             {
                 "module": MODULE_NAME,
@@ -537,10 +539,6 @@ def can_backfire_roast(attacker_pig: Optional[dict]) -> bool:
     )
 
 
-def get_expert_level(copies: int) -> int:
-    return min(max(int(copies) - 1, 0), get_growth_max_expert_level())
-
-
 async def pick_daily_roll_candidate(user_id: str) -> dict:
     """按用户成长状态选择今日候选猪，连续重复会提高未解锁猪的权重。"""
     draw_state = await store.get_draw_state(user_id)
@@ -561,21 +559,54 @@ async def pick_daily_roll_candidate(user_id: str) -> dict:
     return random.choices(PIG_LIST, weights=weights, k=1)[0]
 
 
-def build_roll_growth_text(result: DailyRollResult, pig_data: dict) -> str:
+def build_roll_growth_text(
+    result: DailyRollResult,
+    pig_data: dict,
+    *,
+    include_variant: bool = True,
+) -> str:
     """生成今日首次抽猪后的成长提示，重复查看当天结果不刷提示。"""
     if not result.created:
         return ""
 
     pig_name = pig_data.get("name", "未知小猪")
-    current_level = get_expert_level(result.copies)
+    current_level = expert_level_from_copies(result.copies)
     if result.is_new_pig:
         return random.choice(DAILY_ROLL_NEW_PIG_TEXTS).format(
             pig=pig_name,
             level=current_level,
         )
 
-    previous_level = get_expert_level(result.previous_copies)
+    previous_level = expert_level_from_copies(result.previous_copies)
     if previous_level != current_level:
+        if include_variant:
+            unlocked_levels = pig_resource_manager.newly_unlocked_variant_levels(
+                str(pig_data.get("id") or ""),
+                previous_level,
+                current_level,
+            )
+            changed_fields = frozenset().union(
+                *(
+                    pig_resource_manager.variant_change_fields(
+                        str(pig_data.get("id") or ""),
+                        level,
+                    )
+                    for level in unlocked_levels
+                )
+            )
+            pool_key = {
+                frozenset({"image"}): "image",
+                frozenset({"text"}): "text",
+                frozenset({"image", "text"}): "image_text",
+            }.get(changed_fields)
+            if pool_key:
+                return random.choice(
+                    DAILY_ROLL_VARIANT_LEVEL_UP_TEXTS[pool_key]
+                ).format(
+                    pig=pig_name,
+                    old_level=previous_level,
+                    new_level=current_level,
+                )
         return random.choice(DAILY_ROLL_DUPLICATE_LEVEL_UP_TEXTS).format(
             pig=pig_name,
             old_level=previous_level,
@@ -599,7 +630,7 @@ def build_pigsty_growth_notes(draw_state: DrawState) -> list[str]:
     favorite_id, favorite_progress = ranked_progress[0]
     favorite = get_pig_by_id(favorite_id)
     favorite_name = favorite.get("name", favorite_id) if favorite else favorite_id
-    favorite_level = get_expert_level(favorite_progress.copies)
+    favorite_level = expert_level_from_copies(favorite_progress.copies)
     notes = [
         f"本命猪：【{favorite_name}】EX Lv. {favorite_level}"
         f"（累计 {favorite_progress.copies} 次）"
@@ -615,7 +646,9 @@ def build_pigsty_growth_notes(draw_state: DrawState) -> list[str]:
         for pig_id, progress in repeat_items:
             pig = get_pig_by_id(pig_id)
             pig_name = pig.get("name", pig_id) if pig else pig_id
-            parts.append(f"【{pig_name}】EX Lv.{get_expert_level(progress.copies)}")
+            parts.append(
+                f"【{pig_name}】EX Lv.{expert_level_from_copies(progress.copies)}"
+            )
         notes.append("高等级小猪：" + "、".join(parts))
 
     if draw_state.duplicate_streak > 0:
@@ -628,7 +661,7 @@ def build_pigsty_growth_notes(draw_state: DrawState) -> list[str]:
 def build_pigsty_growth_stats(draw_state: DrawState) -> list[dict[str, str]]:
     """计算成长面板的等级统计，和图鉴数量统计分开维护。"""
     levels = [
-        get_expert_level(progress.copies)
+        expert_level_from_copies(progress.copies)
         for progress in draw_state.progress.values()
     ]
     max_level = max(levels, default=0)
@@ -1426,36 +1459,76 @@ async def send_rendered_pig(
     extra_text: str = "",
     is_new: bool = False,
     cache_final_card: bool = True,
+    ex_level: int = 0,
+    fallback_extra_text: str | None = None,
 ):
     pig_id = str(pig_data.get("id") or "")
-    avatar_file = find_image_file(pig_id)
+    appearance = pig_resource_manager.resolve_pig_appearance(pig_data, ex_level)
+    render_data = appearance.pig_data
+    avatar_file = appearance.image_path
+    uses_variant_image = (
+        avatar_file is not None and avatar_file != appearance.base_image_path
+    )
+    variant_fallback = False
     try:
         render_result = await render_pig_card_image(
-            pig_data,
+            render_data,
             avatar_file,
             is_new=is_new,
+            require_avatar=uses_variant_image,
             cache_final_card=cache_final_card,
             resource_version=pig_resource_manager.resource_version,
         )
         pic = render_result.data
     except Exception as error:
-        logger.exception(
-            "rollpig PIL 卡片渲染失败，回退 HTML: "
-            f"pig_id={pig_id}, image={avatar_file}, error={error}"
-        )
-        try:
-            pic = await _render_pig_card_html(
-                pig_data,
-                avatar_file,
-                is_new=is_new,
+        if uses_variant_image:
+            variant_fallback = True
+            logger.warning(
+                "rollpig EX 差分渲染失败，已回退基础资源: "
+                f"pig_id={pig_id}, requested={appearance.requested_level}, "
+                f"applied={appearance.applied_level}, error={error}"
             )
-        except Exception as fallback_error:
+            try:
+                render_result = await render_pig_card_image(
+                    dict(pig_data),
+                    appearance.base_image_path,
+                    is_new=is_new,
+                    require_avatar=False,
+                    cache_final_card=cache_final_card,
+                    resource_version=pig_resource_manager.resource_version,
+                )
+                pic = render_result.data
+            except Exception as fallback_error:
+                error = fallback_error
+            else:
+                error = None
+        if error is None:
+            pass
+        else:
+            fallback_data = dict(pig_data) if variant_fallback else render_data
+            fallback_image = (
+                appearance.base_image_path if variant_fallback else avatar_file
+            )
             logger.exception(
-                "rollpig HTML 卡片回退失败: "
-                f"pig_id={pig_id}, image={avatar_file}, error={fallback_error}"
+                "rollpig PIL 卡片渲染失败，回退 HTML: "
+                f"pig_id={pig_id}, image={fallback_image}, error={error}"
             )
-            await matcher.finish("图片生成失败。")
-            return
+            try:
+                pic = await _render_pig_card_html(
+                    fallback_data,
+                    fallback_image,
+                    is_new=is_new,
+                )
+            except Exception as fallback_error:
+                logger.exception(
+                    "rollpig HTML 卡片回退失败: "
+                    f"pig_id={pig_id}, image={fallback_image}, error={fallback_error}"
+                )
+                await matcher.finish("图片生成失败。")
+                return
+
+    if variant_fallback and fallback_extra_text is not None:
+        extra_text = fallback_extra_text
 
     msg = MessageSegment.reply(event.message_id)
     if extra_text:
@@ -1497,7 +1570,9 @@ async def _(event: Event):
     pig_id = await store.get_daily_roll(user_id)
     pig = get_pig_by_id(pig_id)
     extra_text = ""
+    fallback_extra_text = ""
     is_new = False
+    ex_level: int | None = None
 
     if pig_id and not pig:
         logger.warning(f"RollPig 今日形态资源缺失: user={user_id} pig_id={pig_id}")
@@ -1518,10 +1593,28 @@ async def _(event: Event):
         is_new = roll_result.created and roll_result.pig_id not in unlocked_before
         pig = get_pig_by_id(roll_result.pig_id) or proposed_pig
         extra_text = build_roll_growth_text(roll_result, pig)
+        fallback_extra_text = build_roll_growth_text(
+            roll_result,
+            pig,
+            include_variant=False,
+        )
+        ex_level = expert_level_from_copies(roll_result.copies)
     elif group_id:
         await store.mark_group_roll_seen(user_id, pig["id"], group_id)
 
-    await send_rendered_pig(cmd_today, event, pig, extra_text=extra_text, is_new=is_new)
+    if pig and ex_level is None:
+        draw_state = await store.get_draw_state(user_id)
+        ex_level = expert_level_from_copies(draw_state.copies_of(str(pig["id"])))
+
+    await send_rendered_pig(
+        cmd_today,
+        event,
+        pig,
+        extra_text=extra_text,
+        is_new=is_new,
+        ex_level=ex_level or 0,
+        fallback_extra_text=fallback_extra_text,
+    )
 
 
 # 2. 随机小猪

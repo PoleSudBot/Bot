@@ -86,6 +86,21 @@ DAILY_ROLL_DUPLICATE_LEVEL_UP_TEXTS = [
     "｜重复的怨念转化成了新猪加成。",
 ]
 
+DAILY_ROLL_VARIANT_LEVEL_UP_TEXTS = {
+    "image": [
+        "【{pig}】EX Lv. {old_level} → {new_level}｜解锁了新的小猪外观！",
+        "【{pig}】升级到 EX Lv. {new_level}｜今天换上了全新造型。",
+    ],
+    "text": [
+        "【{pig}】EX Lv. {old_level} → {new_level}｜解锁了新的形态介绍！",
+        "【{pig}】升级到 EX Lv. {new_level}｜猪生档案有了新的变化。",
+    ],
+    "image_text": [
+        "【{pig}】EX Lv. {old_level} → {new_level}｜新外观与新档案同时解锁！",
+        "【{pig}】升级到 EX Lv. {new_level}｜形象和介绍一起焕新。",
+    ],
+}
+
 DAILY_ROLL_DUPLICATE_SAME_LEVEL_TEXTS = [
     "你又抽到了【{pig}】｜专家等级 EX Lv. {level}｜下次遇见新猪的机会悄悄升温。",
     "重复命中【{pig}】｜EX Lv. {level}｜猪圈正在暗中给新猪加热。",
