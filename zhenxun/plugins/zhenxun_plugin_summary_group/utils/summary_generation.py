@@ -8,15 +8,14 @@ import markdown
 from nonebot.adapters.onebot.v11 import Bot
 from nonebot_plugin_alconna.uniseg import MsgTarget, UniMessage
 
-from zhenxun.services.llm import (
-    LLMException,
-    LLMGenerationConfig,
-    LLMMessage,
-    get_global_default_model_name,
+from zhenxun.services.ai import LLMMessage, generate
+from zhenxun.services.ai.core.exceptions import LLMException
+from zhenxun.services.ai.core.options import GenerationConfig, ReasoningEffort
+from zhenxun.services.ai.llm.manager import (
+    get_default_model,
     get_model_instance,
     list_available_models,
 )
-from zhenxun.services.llm.config.generation import ReasoningConfig, ReasoningEffort
 from zhenxun.services.log import logger
 
 from .. import base_config
@@ -62,7 +61,7 @@ def resolve_summary_model_name(
         logger.debug(f"使用插件默认模型: {plugin_default_model}")
         return plugin_default_model
 
-    global_default_model = get_global_default_model_name()
+    global_default_model = get_default_model("chat")
     if global_default_model:
         logger.debug(f"使用LLM全局默认模型: {global_default_model}")
         return global_default_model
@@ -112,24 +111,25 @@ def _looks_like_deepseek(model: Any, resolved_model_name: str | None) -> bool:
 
 def _build_summary_generation_config(
     model: Any, resolved_model_name: str | None
-) -> LLMGenerationConfig:
+) -> GenerationConfig:
     """为总结任务构造只返回最终答案的模型配置。"""
     mode = _get_summary_thinking_mode()
-    config = LLMGenerationConfig()
+    config = GenerationConfig()
 
     # Gemini 的思考摘要由 includeThoughts 控制；总结场景只需要最终答案。
     if _looks_like_gemini(model, resolved_model_name):
-        if mode == "off":
-            config.reasoning = ReasoningConfig(show_thoughts=False)
-        else:
-            effort = ReasoningEffort(mode.upper())
-            config.reasoning = ReasoningConfig(effort=effort, show_thoughts=False)
+        config.common.reasoning_effort = (
+            ReasoningEffort.NONE
+            if mode == "off"
+            else ReasoningEffort(mode.upper())
+        )
+        config.gemini_options.include_thoughts = False
         return config
 
     # DeepSeek V4 默认启用 thinking；总结默认显式关闭，避免 reasoning_content 泄漏。
     if _looks_like_deepseek(model, resolved_model_name):
         thinking_type = "disabled" if mode == "off" else "enabled"
-        config.custom_params = {"thinking": {"type": thinking_type}}
+        config.custom_kwargs = {"thinking": {"type": thinking_type}}
         return config
 
     return config
@@ -232,15 +232,17 @@ async def messages_summary(
             f"开始调用LLM服务进行总结，模型: {final_model_name_str or 'LLM全局默认'}"
         )
 
-        async with await get_model_instance(final_model_name_str) as model:
-            from ..config import summary_config
+        model = await get_model_instance(final_model_name_str)
+        from ..config import summary_config
 
-            config = _build_summary_generation_config(model, final_model_name_str)
-
-            response = await model.generate_response(
-                llm_messages, config=config, timeout=summary_config.get_timeout()
-            )
-            summary_text = response.text
+        config = _build_summary_generation_config(model, final_model_name_str)
+        response = await generate(
+            llm_messages,
+            model=final_model_name_str,
+            config=config,
+            timeout=summary_config.get_timeout(),
+        )
+        summary_text = response.text
 
         summary_text = _strip_visible_thinking(summary_text)
 

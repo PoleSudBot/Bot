@@ -6,7 +6,7 @@ from nonebot_plugin_alconna.uniseg import MsgTarget
 
 from zhenxun.configs.config import Config
 from zhenxun.models.level_user import LevelUser
-from zhenxun.services.llm import list_available_models
+from zhenxun.services.ai.llm.manager import list_available_models
 from zhenxun.services.log import logger
 
 from .. import base_config

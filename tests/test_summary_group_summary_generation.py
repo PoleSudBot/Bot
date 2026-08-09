@@ -44,22 +44,17 @@ class _FakeBaseConfig:
 
 
 class _FakeReasoningEffort(str, Enum):
+    NONE = "NONE"
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
 
 
-class _FakeReasoningConfig:
-    def __init__(self, *, effort=None, budget_tokens=None, show_thoughts=None):
-        self.effort = effort
-        self.budget_tokens = budget_tokens
-        self.show_thoughts = show_thoughts
-
-
 class _FakeLLMGenerationConfig:
     def __init__(self):
-        self.reasoning = None
-        self.custom_params = None
+        self.common = SimpleNamespace(reasoning_effort=None)
+        self.gemini_options = SimpleNamespace(include_thoughts=None)
+        self.custom_kwargs = {}
 
 
 class _FakeLLMException(Exception):
@@ -140,25 +135,35 @@ def summary_generation(monkeypatch: pytest.MonkeyPatch):
     logger_module.logger = _FakeLogger()
     services_module = types.ModuleType("zhenxun.services")
     services_module.__path__ = []
-    llm_module = types.ModuleType("zhenxun.services.llm")
-    llm_module.LLMException = _FakeLLMException
-    llm_module.LLMGenerationConfig = _FakeLLMGenerationConfig
-    llm_module.LLMMessage = _FakeLLMMessage
-    llm_module.get_global_default_model_name = lambda: None
-    llm_module.get_model_instance = None
-    llm_module.list_available_models = lambda: []
-    llm_config_module = types.ModuleType("zhenxun.services.llm.config")
-    llm_config_module.__path__ = []
-    llm_generation_module = types.ModuleType("zhenxun.services.llm.config.generation")
-    llm_generation_module.ReasoningConfig = _FakeReasoningConfig
-    llm_generation_module.ReasoningEffort = _FakeReasoningEffort
+    ai_module = types.ModuleType("zhenxun.services.ai")
+    ai_module.__path__ = []
+    ai_module.LLMMessage = _FakeLLMMessage
+    ai_module.generate = None
+    ai_core_module = types.ModuleType("zhenxun.services.ai.core")
+    ai_core_module.__path__ = []
+    ai_exceptions_module = types.ModuleType("zhenxun.services.ai.core.exceptions")
+    ai_exceptions_module.LLMException = _FakeLLMException
+    ai_options_module = types.ModuleType("zhenxun.services.ai.core.options")
+    ai_options_module.GenerationConfig = _FakeLLMGenerationConfig
+    ai_options_module.ReasoningEffort = _FakeReasoningEffort
+    ai_llm_module = types.ModuleType("zhenxun.services.ai.llm")
+    ai_llm_module.__path__ = []
+    ai_manager_module = types.ModuleType("zhenxun.services.ai.llm.manager")
+    ai_manager_module.get_default_model = lambda _modality: None
+    ai_manager_module.get_model_instance = None
+    ai_manager_module.list_available_models = lambda: []
     monkeypatch.setitem(sys.modules, "zhenxun.services", services_module)
-    monkeypatch.setitem(sys.modules, "zhenxun.services.llm", llm_module)
-    monkeypatch.setitem(sys.modules, "zhenxun.services.llm.config", llm_config_module)
+    monkeypatch.setitem(sys.modules, "zhenxun.services.ai", ai_module)
+    monkeypatch.setitem(sys.modules, "zhenxun.services.ai.core", ai_core_module)
     monkeypatch.setitem(
-        sys.modules,
-        "zhenxun.services.llm.config.generation",
-        llm_generation_module,
+        sys.modules, "zhenxun.services.ai.core.exceptions", ai_exceptions_module
+    )
+    monkeypatch.setitem(
+        sys.modules, "zhenxun.services.ai.core.options", ai_options_module
+    )
+    monkeypatch.setitem(sys.modules, "zhenxun.services.ai.llm", ai_llm_module)
+    monkeypatch.setitem(
+        sys.modules, "zhenxun.services.ai.llm.manager", ai_manager_module
     )
     monkeypatch.setitem(sys.modules, "zhenxun.services.log", logger_module)
 
@@ -186,27 +191,22 @@ async def test_summary_prompt_does_not_request_visible_thinking(
         text = "最终总结"
         thought_text = "内部思考"
 
-    class FakeContextModel(_FakeModel):
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def generate_response(self, messages, config=None, timeout=None):
-            captured["messages"] = messages
-            captured["config"] = config
-            captured["timeout"] = timeout
-            return FakeResponse()
-
     async def fake_get_model_instance(_model_name):
-        return FakeContextModel(
+        return _FakeModel(
             api_type="gemini",
             provider_name="Gemini",
             model_name="gemini-3.5-flash",
         )
 
+    async def fake_generate(messages, *, model=None, config=None, timeout=None):
+        captured["messages"] = messages
+        captured["model"] = model
+        captured["config"] = config
+        captured["timeout"] = timeout
+        return FakeResponse()
+
     monkeypatch.setattr(module, "get_model_instance", fake_get_model_instance)
+    monkeypatch.setattr(module, "generate", fake_generate)
 
     result = await module.messages_summary(
         target=SimpleNamespace(id="123", private=True),
@@ -233,9 +233,8 @@ def test_gemini_default_disables_visible_thoughts(summary_generation):
 
     config = module._build_summary_generation_config(model, "Gemini/gemini-3.5-flash")
 
-    assert config.reasoning is not None
-    assert config.reasoning.show_thoughts is False
-    assert config.reasoning.effort is None
+    assert config.common.reasoning_effort == _FakeReasoningEffort.NONE
+    assert config.gemini_options.include_thoughts is False
 
 
 def test_gemini_high_keeps_thoughts_hidden(summary_generation):
@@ -249,9 +248,8 @@ def test_gemini_high_keeps_thoughts_hidden(summary_generation):
 
     config = module._build_summary_generation_config(model, "Gemini/gemini-3.5-flash")
 
-    assert config.reasoning is not None
-    assert config.reasoning.effort == _FakeReasoningEffort.HIGH
-    assert config.reasoning.show_thoughts is False
+    assert config.common.reasoning_effort == _FakeReasoningEffort.HIGH
+    assert config.gemini_options.include_thoughts is False
 
 
 def test_deepseek_default_disables_thinking(summary_generation):
@@ -266,7 +264,7 @@ def test_deepseek_default_disables_thinking(summary_generation):
         model, "DeepSeek/deepseek-v4-flash"
     )
 
-    assert config.custom_params == {"thinking": {"type": "disabled"}}
+    assert config.custom_kwargs == {"thinking": {"type": "disabled"}}
 
 
 def test_deepseek_enabled_mode_keeps_answer_field_only(summary_generation):
@@ -282,7 +280,7 @@ def test_deepseek_enabled_mode_keeps_answer_field_only(summary_generation):
         model, "DeepSeek/deepseek-v4-flash"
     )
 
-    assert config.custom_params == {"thinking": {"type": "enabled"}}
+    assert config.custom_kwargs == {"thinking": {"type": "enabled"}}
 
 
 def test_strip_visible_thinking_handles_case_and_attributes(summary_generation):

@@ -1,7 +1,7 @@
 from nonebot.adapters.onebot.v11 import Bot
 from pydantic import BaseModel, Field
 
-from zhenxun.services.llm import LLMException
+from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.log import logger
 from zhenxun.services.scheduler import ScheduleContext, scheduler_manager
 

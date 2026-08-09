@@ -9,7 +9,7 @@ from nonebot_plugin_alconna.uniseg import MsgTarget, UniMessage
 from pydantic import BaseModel, Field
 
 from zhenxun.configs.path_config import DATA_PATH
-from zhenxun.services.llm import LLMException
+from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.log import logger
 
 from . import base_config
