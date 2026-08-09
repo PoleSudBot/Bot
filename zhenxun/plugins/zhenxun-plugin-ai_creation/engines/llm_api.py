@@ -1,6 +1,6 @@
 from typing import Any
 
-from zhenxun.services.llm import create_image
+from zhenxun.services.ai import create_image
 from zhenxun.services.log import logger
 
 from ..config import base_config
@@ -8,7 +8,7 @@ from . import DrawEngine
 
 
 class LlmApiEngine(DrawEngine):
-    """使用 zhenxun.services.llm API 的绘图引擎"""
+    """使用统一 AI API 的绘图引擎"""
 
     async def draw(
         self,

@@ -18,16 +18,9 @@ from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, Field
 
 from zhenxun.services import avatar_service
-from zhenxun.services.llm import (
-    CommonOverrides,
-    LLMMessage,
-    generate,
-    message_to_unimessage,
-    unimsg_to_llm_parts,
-)
-from zhenxun.services.llm.config import LLMGenerationConfig
-from zhenxun.services.llm.config.generation import OutputConfig
-from zhenxun.services.llm.types import get_user_friendly_error_message
+from zhenxun.services.ai import LLMMessage, MessageBuilder, generate
+from zhenxun.services.ai.core.exceptions import get_user_friendly_error_message
+from zhenxun.services.ai.core.options import GenerationConfig, ResponseFormat
 from zhenxun.services.log import logger
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.platform import PlatformUtils
@@ -171,14 +164,11 @@ async def _optimize_draw_prompt(
             f"绘图描述优化将使用模型: {base_config.get('auxiliary_llm_model')}"
         )
 
-        if "gemini" in base_config.get("auxiliary_llm_model", "").lower():
-            gen_config = CommonOverrides.gemini_json()
-        else:
-            gen_config = LLMGenerationConfig(
-                output=OutputConfig(response_format={"type": "json_object"})
-            )
+        gen_config = GenerationConfig()
+        gen_config.output.response_format = ResponseFormat.JSON
+        gen_config.output.response_mime_type = "application/json"
 
-        content_parts = await unimsg_to_llm_parts(user_message)
+        content_parts = await MessageBuilder.unimsg_to_llm_parts(user_message)
         if not content_parts and not template_prompt:
             logger.warning("无法从用户消息中提取有效内容进行优化，将使用原始描述。")
             return original_prompt
@@ -193,7 +183,9 @@ async def _optimize_draw_prompt(
             for seg in user_message:
                 if not isinstance(seg, str):
                     fusion_message.append(seg)
-            final_content_parts = await unimsg_to_llm_parts(fusion_message)
+            final_content_parts = await MessageBuilder.unimsg_to_llm_parts(
+                fusion_message
+            )
         else:
             system_prompt = SYSTEM_PROMPT_OPTIMIZE
             final_content_parts = content_parts
@@ -206,7 +198,7 @@ async def _optimize_draw_prompt(
         llm_response = await generate(
             messages,
             model=base_config.get("auxiliary_llm_model"),
-            **gen_config.to_dict(),
+            config=gen_config,
         )
 
         response_text = llm_response.text
@@ -335,7 +327,9 @@ class DrawingService:
         user_intent_message = UniMessage(new_message_parts)
 
         if self.ctx.event.reply and self.ctx.event.reply.message:  # type: ignore
-            reply_unimsg = message_to_unimessage(self.ctx.event.reply.message)
+            reply_unimsg = MessageBuilder.message_to_unimessage(
+                self.ctx.event.reply.message
+            )
             if reply_unimsg[UniImage]:
                 for seg in reply_unimsg:
                     if isinstance(seg, UniImage):
@@ -513,11 +507,8 @@ class DrawingService:
         try:
             gen_config = None
             if self.ctx.image_size:
-                from zhenxun.services.llm.config.generation import GenConfigBuilder
-
-                builder = GenConfigBuilder()
-                builder.config_visual(resolution=self.ctx.image_size)
-                gen_config = builder.build()
+                gen_config = GenerationConfig()
+                gen_config.media.resolution = self.ctx.image_size
 
             draw_result = await self.ctx.engine.draw(
                 self.ctx.final_prompt, self.ctx.image_bytes_list, config=gen_config

@@ -4,7 +4,8 @@ import random
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field
 
-from zhenxun.services.llm import create_multimodal_message, generate_structured
+from zhenxun.services.ai import LLMMessage, generate_structured
+from zhenxun.services.ai.core.messages import ImagePart, TextPart
 from zhenxun.services.log import logger
 
 from ...config import base_config
@@ -108,8 +109,11 @@ async def _solve_drag_captcha_attempt(page: Page) -> bool:
         logger.debug(f"   - 验证码提示: '{captcha_prompt}'")
         logger.debug(f"   - 已截取验证码区域图片 ({len(screenshot_bytes)} bytes)")
 
-        message = create_multimodal_message(
-            text=f"问题是：'{captcha_prompt}'", images=[screenshot_bytes]
+        message = LLMMessage.user(
+            [
+                TextPart(text=f"问题是：'{captcha_prompt}'"),
+                ImagePart(raw=screenshot_bytes, mime_type="image/png"),
+            ]
         )
         logger.debug("   - 正在调用Vision LLM分析验证码...")
         solution = await generate_structured(
