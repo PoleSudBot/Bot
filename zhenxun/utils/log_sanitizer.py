@@ -167,7 +167,7 @@ def _sanitize_openai_response(response_json: dict) -> dict:
 
 def _sanitize_openai_request(body: dict) -> dict:
     """净化OpenAI兼容API的请求体，主要截断图片base64。"""
-    from zhenxun.services.llm.config.providers import (
+    from zhenxun.services.ai.config import (
         DebugLogOptions,
         get_llm_config,
     )
@@ -212,7 +212,7 @@ def _sanitize_openai_request(body: dict) -> dict:
 
 def _sanitize_gemini_response(response_json: dict) -> dict:
     """净化Gemini API的响应体，处理文本和图片生成两种格式。"""
-    from zhenxun.services.llm.config.providers import get_llm_config
+    from zhenxun.services.ai.config import get_llm_config
 
     debug_mode = get_llm_config().debug_log
     try:
@@ -274,7 +274,7 @@ def _sanitize_gemini_response(response_json: dict) -> dict:
 
 def _sanitize_gemini_request(body: dict) -> dict:
     """净化Gemini API的请求体，进行结构转换和总结。"""
-    from zhenxun.services.llm.config.providers import (
+    from zhenxun.services.ai.config import (
         DebugLogOptions,
         get_llm_config,
     )

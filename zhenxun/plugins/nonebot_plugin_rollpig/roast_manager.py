@@ -6,7 +6,7 @@ from typing import Dict, List
 
 import nonebot_plugin_localstore as store
 
-from zhenxun.services.llm import LLMMessage, generate
+from zhenxun.services.ai import LLMMessage, generate
 from zhenxun.services.log import logger
 
 from .config import get_ai_enabled, get_llm_model_name

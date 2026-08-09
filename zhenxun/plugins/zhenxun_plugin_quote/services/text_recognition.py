@@ -7,7 +7,8 @@ from nonebot_plugin_alconna.uniseg import Image, Text, UniMessage
 from pydantic import BaseModel, Field
 
 from zhenxun.configs.config import Config
-from zhenxun.services.llm import LLMException, generate_structured
+from zhenxun.services.ai import generate_structured
+from zhenxun.services.ai.core.exceptions import LLMException
 from zhenxun.services.log import logger
 
 from .paddleocr_api import PaddleOCRAPIClient, PaddleOCRAPISettings
