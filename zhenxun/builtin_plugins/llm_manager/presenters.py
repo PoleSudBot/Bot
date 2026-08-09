@@ -1,9 +1,9 @@
-from typing import Any
+import time
+from typing import Any, Literal
 
 from zhenxun import ui
 from zhenxun.services import renderer_service
-from zhenxun.services.llm.core import KeyStatus
-from zhenxun.services.llm.types import ModelModality
+from zhenxun.services.ai.core.models import ModelModality
 from zhenxun.ui.models import StatusBadgeCell, TextCell
 
 
@@ -72,7 +72,7 @@ class Presenters:
 
         cap_list = []
         if ModelModality.IMAGE in caps.input_modalities:
-            cap_list.append("视觉")
+            cap_list.append("图片")
         if ModelModality.VIDEO in caps.input_modalities:
             cap_list.append("视频")
         if ModelModality.AUDIO in caps.input_modalities:
@@ -93,11 +93,16 @@ class Presenters:
         md.head("模型详情", 2)
 
         temp_value = model.temperature or provider.temperature or "未设置"
-        token_value = model.max_tokens or provider.max_tokens or "未设置"
+        input_tokens = caps.max_input_tokens
+        context_window = (
+            f"{int(input_tokens / 1000)}K"
+            if input_tokens >= 1000
+            else str(input_tokens)
+        )
 
         md.text(f"- **名称**: {model.model_name}")
         md.text(f"- **默认温度**: {temp_value}")
-        md.text(f"- **最大Token**: {token_value}")
+        md.text(f"- **上下文窗口**: {context_window}")
         md.text(f"- **核心能力**: {', '.join(cap_list) or '纯文本'}")
 
         return await renderer_service.render(md.with_style("light"))
@@ -112,33 +117,41 @@ class Presenters:
         data_list = []
 
         for key_info in sorted_stats:
-            status_enum: KeyStatus = key_info["status_enum"]
+            status_str = key_info.get("status", "HEALTHY")
+            successes = key_info.get("successes", 0)
+            failures = key_info.get("failures", 0)
+            total_calls = successes + failures
 
-            if status_enum == KeyStatus.COOLDOWN:
-                cooldown_seconds = int(key_info["cooldown_seconds_left"])
+            if total_calls == 0 and status_str == "HEALTHY":
+                status_str = "UNUSED"
+
+            if status_str == "COOLDOWN":
+                cooldown_seconds = max(
+                    0, int(key_info.get("cooldown_until", 0) - time.time())
+                )
                 formatted_time = _format_seconds(cooldown_seconds)
                 status_cell = StatusBadgeCell(
                     text=f"冷却中({formatted_time})", status_type="info"
                 )
             else:
-                status_map = {
-                    KeyStatus.DISABLED: ("永久禁用", "error"),
-                    KeyStatus.ERROR: ("错误", "error"),
-                    KeyStatus.WARNING: ("告警", "warning"),
-                    KeyStatus.HEALTHY: ("健康", "ok"),
-                    KeyStatus.UNUSED: ("未使用", "info"),
+                status_map: dict[
+                    str,
+                    tuple[str, Literal["ok", "error", "warning", "info", "success"]],
+                ] = {
+                    "DISABLED": ("永久禁用", "error"),
+                    "ERROR": ("错误", "error"),
+                    "WARNING": ("告警", "warning"),
+                    "HEALTHY": ("健康", "ok"),
+                    "UNUSED": ("未使用", "info"),
                 }
-                text, status_type = status_map.get(status_enum, ("未知", "info"))
-                status_cell = StatusBadgeCell(text=text, status_type=status_type)  # type: ignore
+                text, status_type = status_map.get(status_str, ("未知", "info"))
+                status_cell = StatusBadgeCell(text=text, status_type=status_type)
 
-            total_calls = key_info["total_calls"]
             total_calls_text = (
-                f"{key_info['success_count']}/{total_calls}"
-                if total_calls > 0
-                else "0/0"
+                f"{successes}/{total_calls}" if total_calls > 0 else "0/0"
             )
 
-            success_rate = key_info["success_rate"]
+            success_rate = (successes / total_calls * 100) if total_calls > 0 else 100.0
             success_rate_text = f"{success_rate:.1f}%" if total_calls > 0 else "N/A"
             rate_color = None
             if total_calls > 0:
@@ -148,12 +161,17 @@ class Presenters:
                     rate_color = "#E6A23C"
             success_rate_cell = TextCell(content=success_rate_text, color=rate_color)
 
-            avg_latency = key_info["avg_latency"]
-            avg_latency_text = f"{avg_latency / 1000:.2f}" if avg_latency > 0 else "N/A"
+            avg_latency_text = "N/A"
 
             last_error = key_info.get("last_error") or "-"
             if len(last_error) > 25:
                 last_error = last_error[:22] + "..."
+
+            suggested_action = "-"
+            if status_str == "DISABLED":
+                suggested_action = "检查配额或换Key"
+            elif status_str == "COOLDOWN":
+                suggested_action = "等待恢复"
 
             data_list.append(
                 [
@@ -163,7 +181,7 @@ class Presenters:
                     success_rate_cell,
                     TextCell(content=avg_latency_text),
                     TextCell(content=last_error),
-                    TextCell(content=key_info["suggested_action"]),
+                    TextCell(content=suggested_action),
                 ]
             )
 
@@ -180,4 +198,39 @@ class Presenters:
             ]
         )
         table.add_rows(data_list)
+        return await renderer_service.render(table, use_cache=False)
+
+    @staticmethod
+    async def format_mcp_list_as_image(mcp_list: list[dict[str, Any]]) -> bytes:
+        """将MCP列表格式化为表格图片"""
+        title = "MCP 服务管理列表"
+        if not mcp_list:
+            table = ui.table(title=title, tip="当前未配置任何 MCP 服务。").set_headers(
+                ["ID", "MCP名称", "协议", "状态", "目标"]
+            )
+            return await renderer_service.render(table)
+
+        column_name = ["ID", "MCP名称", "协议", "状态", "目标"]
+        rows_data = []
+        for mcp in mcp_list:
+            is_enable = mcp["enabled"]
+            status_type = "success" if is_enable else "info"
+            status_text = "开启" if is_enable else "关闭"
+            rows_data.append(
+                [
+                    TextCell(content=str(mcp["id"])),
+                    TextCell(content=mcp["name"]),
+                    TextCell(content=mcp["transport"]),
+                    StatusBadgeCell(text=status_text, status_type=status_type),
+                    TextCell(content=mcp["target"]),
+                ]
+            )
+
+        table = ui.table(
+            title=title,
+            tip="使用 `llm mcp 开启/关闭 <ID/名称>` 来修改状态，支持批量操作",
+        )
+        table.set_headers(column_name)
+        table.set_column_alignments(["center", "left", "left", "center", "left"])
+        table.add_rows(rows_data)
         return await renderer_service.render(table, use_cache=False)
