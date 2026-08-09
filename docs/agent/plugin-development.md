@@ -35,7 +35,7 @@
 - 网络请求：`from zhenxun.utils.http_utils import AsyncHttpx`
 - 数据模型：`from zhenxun.services.db_context import Model`
 - 图片 / Markdown / 模板渲染：优先使用 `from zhenxun import ui` 的 `render`、`render_template`、`render_markdown` 等入口，复用 `zhenxun.services.renderer` 的主题、模板和截图能力。
-- 调度与大模型：分别优先使用 `zhenxun.services.scheduler` 与 `zhenxun.services.llm` 的现有接口。
+- 调度与大模型：分别优先使用 `zhenxun.services.scheduler` 与 `zhenxun.services.ai` 的现有接口；AI 的详细用法见 [`ai-framework.md`](ai-framework.md)。
 - 生命周期与优先级：`PriorityLifecycle`、driver hooks、现有初始化模式。
 - 规则、依赖注入、渲染、缓存、LLM、调度等能力优先复用仓库已有封装，而不是重新下沉到底层库。
 

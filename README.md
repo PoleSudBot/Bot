@@ -61,6 +61,8 @@ uv run --no-project nbm.py update
 2. 先在 `.env.dev` 中填写 Bot 连接相关配置，并确认本地路径配置可用，例如 `FFMPEG`。
 3. 首次启动后，如需继续调整插件或系统配置，可再检查 `data/config.yaml`。
 
+需要配置大模型、群聊总结、AI 绘图等功能时，请参阅 [AI 能力部署与使用指南](./docs/ai-guide.md)。
+
 ## 致谢
 
 ### 基础项目与协议生态
