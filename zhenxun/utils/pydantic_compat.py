@@ -9,6 +9,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar, get_args, get_origin
+import typing
 
 from nonebot.compat import (
     PYDANTIC_V2,
@@ -23,9 +24,39 @@ import ujson as json
 T = TypeVar("T", bound=BaseModel)
 V = TypeVar("V")
 
+if typing.TYPE_CHECKING:
+    _T_TA = TypeVar("_T_TA")
+
+    class TypeAdapter(typing.Generic[_T_TA]):
+        def __init__(self, type_: Any, **kwargs: Any): ...
+        def validate_python(self, obj: Any) -> _T_TA: ...
+else:
+    try:
+        from pydantic import TypeAdapter, model_validator
+    except ImportError:
+
+        class TypeAdapter:
+            def __init__(self, type_: Any, **kwargs: Any):
+                self.type_ = type_
+
+            def validate_python(self, obj: Any) -> Any:
+                return type_validate_python(self.type_, obj)
+
+        from pydantic import root_validator
+
+        def model_validator(*args: Any, **kwargs: Any) -> Any:
+            mode = kwargs.get("mode", "after")
+            pre = mode == "before"
+
+            def decorator(func: Any) -> Any:
+                return root_validator(pre=pre, allow_reuse=True)(func)
+
+            return decorator
+
 
 __all__ = [
     "PYDANTIC_V2",
+    "TypeAdapter",
     "_dump_pydantic_obj",
     "_is_pydantic_type",
     "compat_computed_field",
@@ -36,7 +67,9 @@ __all__ = [
     "model_dump_json",
     "model_fields",
     "model_json_schema",
+    "model_rebuild",
     "model_validate",
+    "model_validator",
     "parse_as",
     "type_validate_json",
     "type_validate_python",
@@ -147,3 +180,11 @@ def dump_json_safely(obj: Any, **kwargs) -> str:
         )
 
     return json.dumps(obj, default=default_serializer, **kwargs)
+
+
+def model_rebuild(model_class: type[BaseModel], **kwargs: Any) -> None:
+    """重建 Pydantic 前向引用，兼容 V1/V2。"""
+    if PYDANTIC_V2:
+        model_class.model_rebuild(**kwargs)
+    else:
+        model_class.update_forward_refs(**kwargs)

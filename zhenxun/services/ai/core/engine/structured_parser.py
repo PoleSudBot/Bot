@@ -1,0 +1,139 @@
+import json
+import types
+from typing import Any, Generic, Union, cast, get_origin
+
+import json_repair
+from nonebot.compat import type_validate_json
+from pydantic import BaseModel, Field, ValidationError, create_model
+
+from zhenxun.services.ai.core.exceptions import (
+    SchemaParseError,
+    SchemaValidationError,
+)
+from zhenxun.services.ai.core.messages.types import OutputDataT
+from zhenxun.services.ai.utils.logger import log_core as logger
+from zhenxun.utils.pydantic_compat import model_json_schema, model_validate
+
+
+class BaseOutputProcessor(Generic[OutputDataT]):
+    """
+    统一的结构化输出处理器。
+    负责管理 Schema 生成、Prompt 约束注入以及最终的
+    JSON 反序列化和业务校验。
+    """
+
+    def __init__(
+        self,
+        response_model: type[Any] | None = None,
+        error_template: str | None = None,
+        raw_schema: dict[str, Any] | None = None,
+    ):
+        """
+        初始化结构化输出处理器。
+
+        参数:
+            response_model: 期望的输出目标 Pydantic 模型类或 Union 类型，默认 None。
+            error_template: 当 JSON 解析或模型验证失败时，反馈给大模型的 IVR 纠错提示词模板，默认 None。
+            raw_schema: 显式传入的原始 JSON Schema 字典，
+                如果不为 None 则跳过根据 response_model 生成，默认 None。
+        """  # noqa: E501
+        self.original_model = response_model
+        self.error_template = error_template
+        self.raw_schema = raw_schema
+        self.target_model = None
+        self.is_union_wrapped = False
+
+        if response_model is not None:
+            self.target_model, self.is_union_wrapped = self._create_union_wrapper(
+                response_model
+            )
+
+    @staticmethod
+    def _create_union_wrapper(union_type: Any) -> tuple[type[BaseModel], bool]:
+        """[私有方法] 如果是 Union 类型，
+        动态构建带 kind 区分字段的模型"""
+        origin = get_origin(union_type)
+        union_types = [Union]
+        if hasattr(types, "UnionType"):
+            union_types.append(types.UnionType)
+
+        if origin not in union_types:
+            return union_type, False
+
+        UnionWrapper = create_model(
+            "UnionResponseWrapper",
+            result=(
+                union_type,
+                Field(..., description="根据你的决策，输出对应的结构化数据"),
+            ),
+        )
+        return UnionWrapper, True
+
+    def get_json_schema(self) -> dict[str, Any]:
+        """提取目标模型的 JSON Schema"""
+        if self.raw_schema is not None:
+            return self.raw_schema
+        if self.target_model is None:
+            raise ValueError("未提供 response_model 或 raw_schema")
+        try:
+            return model_json_schema(self.target_model)
+        except AttributeError:
+            return self.target_model.schema()
+
+    def _parse_and_validate(self, text: str) -> Any:
+        """[私有方法] 执行带有容错修复的 JSON 解析与模型验证"""
+        if self.raw_schema is not None:
+            try:
+                return json.loads(text)
+            except Exception:
+                try:
+                    return json_repair.loads(text, skip_json_loads=True)
+                except Exception as repair_error:
+                    raise SchemaParseError(f"JSON格式损坏: {repair_error}")
+        if self.target_model is None:
+            raise SchemaParseError("未提供 response_model 或 raw_schema")
+        try:
+            return type_validate_json(self.target_model, text)
+        except (ValidationError, ValueError) as e:
+            try:
+                logger.warning(f"标准JSON解析失败，尝试使用json_repair修复: {e}")
+                repaired_obj = json_repair.loads(text, skip_json_loads=True)
+                return model_validate(self.target_model, repaired_obj)
+            except Exception as repair_error:
+                logger.debug(
+                    "JSON修复或模型校验失败，将交由大模型进行反思自愈: "
+                    f"{type(repair_error).__name__}"
+                )
+                if isinstance(repair_error, ValidationError):
+                    error_msgs = []
+                    for err in repair_error.errors():
+                        loc = ".".join(str(x) for x in err["loc"]) or "root"
+                        msg = err.get("msg", "")
+                        error_msgs.append(f"字段 `{loc}`: {msg}")
+                    clean_error_str = "\n".join(error_msgs)
+                    raise SchemaValidationError(
+                        f"数据内容未通过规则校验:\n{clean_error_str}"
+                    )
+
+                raise SchemaParseError(
+                    f"JSON格式损坏或字段不匹配，未能通过Schema验证: {repair_error}"
+                )
+        except Exception as e:
+            logger.error(f"解析LLM结构化输出时发生未知错误: {e}", e=e)
+            raise SchemaParseError(f"解析LLM的JSON输出时失败: {e}")
+
+    async def validate_and_parse(self, text: str, context: Any = None) -> OutputDataT:
+        """执行 JSON 解析与回调验证"""
+        try:
+            parsed_obj = self._parse_and_validate(text)
+
+            current_obj = parsed_obj
+
+            if getattr(self, "is_union_wrapped", False):
+                current_obj = getattr(current_obj, "result")
+
+            final_obj = cast(OutputDataT, current_obj)
+
+            return final_obj
+        except Exception as e:
+            raise e

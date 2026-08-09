@@ -57,6 +57,8 @@ dependencies = [
     "json_repair>=0.54.0,<0.60.0",
     "alibabacloud-devops20210625>=5.0.2,<6.0.0",
     "nonebot-plugin-datastore",
+    "httpx>=0.20,<1.0",
+    "pyyaml>=6,<7",
     "nonebot-plugin-memes",
     "nonebot-plugin-heweather",
     "nonebot-plugin-paper",
@@ -81,6 +83,8 @@ dependencies = [
     "chinesecalendar>=1.11.0",
     "openai>=2.24.0",
     "lunardate>=0.2.2",
+    "mcp>=1.8.0",
+    "aiodocker>=0.24.0",
     "mcstatus>=13.1.0,<14.0.0",
     "mctools>=1.4.1,<2.0.0",
 ]

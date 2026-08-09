@@ -114,15 +114,17 @@ class GeminiAdapter(BaseAdapter):
         headers = self.get_base_headers(api_key, model)
 
         converter = GeminiMessageConverter()
-        system_instruction_parts: list[dict[str, Any]] | None = None
+        system_instruction_parts: list[dict[str, Any]] = []
         for msg in messages:
             if msg.role == "system":
+                # Gemini 只有一个 systemInstruction 字段，多条 system 必须按顺序合并。
                 if isinstance(msg.content, str):
-                    system_instruction_parts = [{"text": msg.content}]
+                    system_instruction_parts.append({"text": msg.content})
                 elif isinstance(msg.content, list):
-                    system_instruction_parts = [
-                        await converter.convert_part(part) for part in msg.content
-                    ]
+                    for part in msg.content:
+                        system_instruction_parts.append(
+                            await converter.convert_part(part)
+                        )
                 continue
 
         gemini_contents = await converter.convert_messages_async(messages)
