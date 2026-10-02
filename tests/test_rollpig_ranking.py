@@ -616,12 +616,12 @@ def load_rollpig_roast_manager_module(
     fake_zhenxun.__path__ = []
     fake_services = types.ModuleType("zhenxun.services")
     fake_services.__path__ = []
-    fake_llm = types.ModuleType("zhenxun.services.llm")
-    fake_llm.LLMMessage = types.SimpleNamespace(
+    fake_ai = types.ModuleType("zhenxun.services.ai")
+    fake_ai.LLMMessage = types.SimpleNamespace(
         system=lambda text: ("system", text),
         user=lambda text: ("user", text),
     )
-    fake_llm.generate = lambda *_args, **_kwargs: None
+    fake_ai.generate = lambda *_args, **_kwargs: None
     fake_log = types.ModuleType("zhenxun.services.log")
     fake_log.logger = FakeLogger()
 
@@ -636,7 +636,7 @@ def load_rollpig_roast_manager_module(
         "nonebot_plugin_localstore": fake_localstore,
         "zhenxun": fake_zhenxun,
         "zhenxun.services": fake_services,
-        "zhenxun.services.llm": fake_llm,
+        "zhenxun.services.ai": fake_ai,
         "zhenxun.services.log": fake_log,
         package_name: fake_package,
         f"{package_name}.config": fake_config,
