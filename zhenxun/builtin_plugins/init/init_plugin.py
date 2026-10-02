@@ -178,6 +178,14 @@ async def _():
     await PluginInfo.filter(module_path__in=load_plugin).update(load_status=True)
     await PluginInfo.filter(module_path__not_in=load_plugin).update(load_status=False)
     manager.init()
+    if (
+        (wallet_block := manager.block_data.get("wallet"))
+        and wallet_block.status
+        and wallet_block.check_type == BlockType.GROUP
+        and wallet_block.watch_type == LimitWatchType.USER
+        and not wallet_block.result
+    ):
+        wallet_block.result = "钱包操作处理中，请稍候。"
     if limit_list:
         for limit in limit_list:
             if not manager.exists(limit.module, limit.limit_type):
