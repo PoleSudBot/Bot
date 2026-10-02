@@ -49,6 +49,7 @@ dependencies = [
     "aiocache[redis]>=0.12.3,<0.13.0",
     "py-cpuinfo>=9.0.0,<10.0.0",
     "nonebot-plugin-alconna>=0.59.0",
+    "nonebot-plugin-localstore>=0.6,<1.0",
     "nonebot-plugin-genshinuid",
     "tenacity>=9.0.0,<10.0.0",
     "nonebot-plugin-uninfo>0.4.1",
@@ -87,6 +88,9 @@ dependencies = [
     "aiodocker>=0.24.0",
     "mcstatus>=13.1.0,<14.0.0",
     "mctools>=1.4.1,<2.0.0",
+    "jieba>=0.42.1",
+    # nonebot-plugin-multincm 的既有传递依赖，显式声明后才能稳定使用下方 wheel 源重新锁定。
+    "pyncm>=1.8.1",
 ]
 # --- 修改部分结束 ---
 
@@ -119,6 +123,7 @@ nonebot-plugin-paper = {path = "plugins/nonebot-plugin-paper", editable = true}
 nonebot-plugin-fortune = {path = "plugins/nonebot_plugin_fortune", editable = true}
 nonebot-plugin-today-waifu = {path = "plugins/nonebot-plugin-today-waifu", editable = true}
 nonebot-plugin-multincm = {path = "plugins/nonebot-plugin-multincm", editable = true}
+pyncm = {url = "https://files.pythonhosted.org/packages/58/f4/05d7a0116bd70dcef0f7214c0e9ee6a50a124525eaefc5c2bb0c5085f0b7/pyncm-1.8.1-py3-none-any.whl"}
 nonebot-plugin-ottohzys = {path = "plugins/nonebot-plugin-ottohzys", editable = true}
 nonebot-plugin-sticker-saver = {path = "plugins/nonebot-plugin-sticker-saver", editable = true}
 nonebot-plugin-githubcard = {path = "plugins/nonebot_plugin_githubcard", editable = true}
