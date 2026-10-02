@@ -265,3 +265,36 @@ def win_on_rm_error(
     except Exception:
         # 仍失败则记录调试日志并忽略，交由上层继续处理
         logger.debug(f"删除失败重试仍失败: {path}")
+
+
+def infer_plugin_namespace(default: str = "global") -> str:
+    """推断当前调用所属插件，用于隔离 AI 工具与消息转换器。"""
+    import inspect
+
+    from nonebot.plugin import get_plugin_by_module_name
+    from nonebot.plugin.manager import _current_plugin
+
+    plugin = _current_plugin.get()
+    if plugin:
+        return plugin.name
+
+    try:
+        for frame_info in inspect.stack()[1:]:
+            module = inspect.getmodule(frame_info.frame)
+            if not module:
+                continue
+            module_name = module.__name__
+            if module_name.startswith(("zhenxun.services.", "zhenxun.utils.")):
+                continue
+            plugin = get_plugin_by_module_name(module_name)
+            if plugin:
+                return plugin.name
+            parts = module_name.split(".")
+            for marker in ("plugins", "builtin_plugins"):
+                if marker in parts:
+                    index = parts.index(marker)
+                    if len(parts) > index + 1:
+                        return parts[index + 1]
+    except Exception:
+        pass
+    return default
