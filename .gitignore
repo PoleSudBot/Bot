@@ -165,6 +165,11 @@ plugins/
 config/
 cache/
 
+# 例外：以上裸模式 config/ 会匹配任意层级的同名目录，误伤了 AI 服务框架的
+# 配置模块源码（zhenxun/services/ai/config/），这里重新纳入版本管理。
+!zhenxun/services/ai/config/
+!zhenxun/services/ai/config/*.py
+
 # rollpig 猪图由静态资源同步写入 localstore，仓库只保留模板与本地 UI 素材。
 zhenxun/plugins/nonebot_plugin_rollpig/resource/image/*.png
 !zhenxun/plugins/nonebot_plugin_rollpig/resource/assets/
