@@ -245,10 +245,12 @@ class SchedulerManager:
         """
 
         job_id = f"ephemeral_runtime_{uuid.uuid4()}"
+        plugin_name = f"ephemeral::{func.__module__}::{func.__name__}::{job_id}"
+        self._registered_tasks[plugin_name] = {"func": func, "model": None}
 
         context = ScheduleContext(
             schedule_id=0,
-            plugin_name=f"runtime::{func.__module__}",
+            plugin_name=plugin_name,
             bot_id=None,
             group_id=None,
             job_kwargs={},

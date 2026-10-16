@@ -76,7 +76,10 @@ async def _load_schedules_from_db():
     ephemeral_count = 0
     for declaration in scheduler_manager._ephemeral_declared_tasks:
         try:
-            job_id = f"runtime::{declaration.plugin_name}::{declaration.func.__name__}"
+            job_id = (
+                f"ephemeral::{declaration.plugin_name}::"
+                f"{declaration.func.__name__}"
+            )
 
             context = ScheduleContext(
                 schedule_id=0,
