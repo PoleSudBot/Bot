@@ -16,6 +16,7 @@ from ..adapters.results import (
 )
 from ..adapters.runtime import MessageUtils, PlatformUtils, logger
 from ..command_parser import ParsedCommand, parse_command
+from ..constants import format_binding_notice
 from ..services import (
     handle_admin_blacklist,
     handle_admin_query_binding,
@@ -35,6 +36,20 @@ from ..services import (
     handle_update,
     handle_visibility,
 )
+
+_BINDING_ACTIONS = {
+    "admin_query_binding",
+    "bind",
+    "default_server",
+    "unbind",
+    "visibility",
+}
+
+
+def _format_action_result(action: str, result: object) -> object:
+    if action in _BINDING_ACTIONS and isinstance(result, str):
+        return format_binding_notice(result)
+    return result
 
 
 async def _command_rule(event: Event, state: T_State) -> bool:
@@ -95,13 +110,21 @@ async def _(
     is_superuser = await SUPERUSER(bot, event)
     can_manage_group = _is_group_admin(event, session)
     if parsed.action.startswith("admin_") and not is_superuser:
-        await _send_result("该指令仅超级用户可用", bot=bot, event=event)
+        await _send_result(
+            _format_action_result(parsed.action, "该指令仅超级用户可用"),
+            bot=bot,
+            event=event,
+        )
         return
     if parsed.action in {"test_live", "test_new_card"} and not (is_superuser or can_manage_group):
         await _send_result("该测试指令仅群管理员或超级用户可用", bot=bot, event=event)
         return
     if parsed.error:
-        await _send_result(parsed.error, bot=bot, event=event)
+        await _send_result(
+            _format_action_result(parsed.action, parsed.error),
+            bot=bot,
+            event=event,
+        )
         return
 
     platform = PlatformUtils.get_platform(session)
@@ -229,7 +252,11 @@ async def _(
             platform=platform,
         )
         return
-    await _send_result(result, bot=bot, event=event)
+    await _send_result(
+        _format_action_result(parsed.action, result),
+        bot=bot,
+        event=event,
+    )
     logger.info(
         f"MoeSekai 执行命令: {parsed.action}",
         parsed.raw_text,

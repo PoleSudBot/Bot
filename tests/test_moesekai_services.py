@@ -289,7 +289,7 @@ async def test_capture_best30_image_returns_haruki_public_api_hint(
 
 
 @pytest.mark.asyncio
-async def test_build_best30_image_uses_master_title_and_fixed_sources(
+async def test_build_best30_image_uses_official_level_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     suite_data = SuiteB30Data(
@@ -301,7 +301,14 @@ async def test_build_best30_image_uses_master_title_and_fixed_sources(
                 "playResult": "all_perfect",
                 "fullComboFlg": True,
                 "fullPerfectFlg": True,
-            }
+            },
+            {
+                "musicId": 999,
+                "musicDifficultyType": "master",
+                "playResult": "full_combo",
+                "fullComboFlg": True,
+                "fullPerfectFlg": False,
+            },
         ],
         user_decks=[],
         user_cards=[],
@@ -330,12 +337,41 @@ async def test_build_best30_image_uses_master_title_and_fixed_sources(
                 "title": "怪獣になりたい",
                 "assetbundleName": "jacket_671",
                 "publishedAt": 1,
-            }
+            },
+            {
+                "id": 999,
+                "title": "官方等级回退歌曲",
+                "assetbundleName": "jacket_999",
+                "publishedAt": 2,
+            },
         ]
 
     async def fake_get_cards(server: str):
         assert server == "jp"
         return []
+
+    async def fake_get_music_difficulties(server: str):
+        assert server == "jp"
+        return [
+            {
+                "musicId": 671,
+                "musicDifficulty": "append",
+                "playLevel": 37,
+                "totalNoteCount": 2700,
+            },
+            {
+                "musicId": 999,
+                "musicDifficulty": "master",
+                "playLevel": 35,
+                "totalNoteCount": 1500,
+            },
+            {
+                "musicId": 1000,
+                "musicDifficulty": "master",
+                "playLevel": 0,
+                "totalNoteCount": 0,
+            },
+        ]
 
     async def fake_avatar(*_args, **_kwargs):
         return ""
@@ -346,21 +382,33 @@ async def test_build_best30_image_uses_master_title_and_fixed_sources(
         *,
         timeout: float,
     ):
-        assert (server, assetbundle_names, timeout) == ("jp", ["jacket_671"], 8)
-        return [b"jacket"]
+        assert (server, assetbundle_names, timeout) == (
+            "jp",
+            ["jacket_671", "jacket_999"],
+            8,
+        )
+        return [b"jacket", b"official-jacket"]
 
     async def fake_render_best30_image(**kwargs):
         result = kwargs["result"]
-        entry = result.entries[0]
         assert kwargs["sources"] == [
             "suite数据来源：Haruki工具箱",
             "定数来源：社区定数",
         ]
-        assert entry.title == "怪獣になりたい"
-        assert entry.level == 38
-        assert entry.level_label == "38"
-        assert entry.constant == 38.1
-        assert entry.jacket_uri == "data:image/png;base64,amFja2V0"
+        community_entry, official_entry = result.entries
+        assert community_entry.title == "怪獣になりたい"
+        assert community_entry.level == 38
+        assert community_entry.level_label == "38"
+        assert community_entry.constant == 38.1
+        assert community_entry.note_count == 2800
+        assert community_entry.jacket_uri == "data:image/png;base64,amFja2V0"
+        assert official_entry.title == "官方等级回退歌曲"
+        assert official_entry.level == 35
+        assert official_entry.level_label == "35"
+        assert official_entry.constant == 35.0
+        assert official_entry.note_count == 1500
+        assert official_entry.user_rating == 34.0
+        assert official_entry.jacket_uri == "data:image/png;base64,b2ZmaWNpYWwtamFja2V0"
         return b"best30"
 
     monkeypatch.setattr(
@@ -382,6 +430,11 @@ async def test_build_best30_image_uses_master_title_and_fixed_sources(
         service_module.master_data_provider,
         "get_cards",
         fake_get_cards,
+    )
+    monkeypatch.setattr(
+        service_module.master_data_provider,
+        "get_music_difficulties",
+        fake_get_music_difficulties,
     )
     monkeypatch.setattr(
         service_module.moesekai_app,
@@ -1398,6 +1451,49 @@ async def test_handle_default_server_still_requires_binding(
     )
 
     assert result == "你还没有绑定任何账号"
+
+
+@pytest.mark.asyncio
+async def test_archive_and_best30_unbound_prompts_add_nickname(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def fake_is_qq_blacklisted(*_args, **_kwargs):
+        return None
+
+    async def fake_resolve_default_server(*_args, **_kwargs):
+        return None, "未绑定"
+
+    monkeypatch.setattr(
+        service_module.moesekai_app,
+        "_is_qq_blacklisted",
+        fake_is_qq_blacklisted,
+    )
+    monkeypatch.setattr(
+        service_module.moesekai_app,
+        "_resolve_default_server",
+        fake_resolve_default_server,
+    )
+
+    archive_result = await service_module.moesekai_app.handle_query_archive(
+        platform="qq",
+        requester_user_id="123456",
+        server=None,
+        game_id=None,
+        target_user_id=None,
+        is_superuser=False,
+    )
+    best30_result = await service_module.moesekai_app.handle_best30(
+        platform="qq",
+        requester_user_id="123456",
+        server=None,
+        game_id=None,
+        target_user_id=None,
+        is_superuser=False,
+    )
+
+    expected = "[南极] 你还没有绑定任何账号，请先使用“绑定 [区服] <游戏ID>”"
+    assert archive_result == expected
+    assert best30_result == expected
 
 
 @pytest.mark.asyncio

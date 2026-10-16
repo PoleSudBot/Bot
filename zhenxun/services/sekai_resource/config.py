@@ -62,6 +62,7 @@ MASTER_DATASET_KEYS = (
     "honorGroups",
     "stamps",
     "musics",
+    "musicDifficulties",
 )
 
 DEFAULT_MASTER_SOURCE_ORDER = ["8823", "haruki", "sekai-viewer"]

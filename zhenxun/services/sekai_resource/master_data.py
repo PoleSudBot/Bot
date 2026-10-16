@@ -983,6 +983,11 @@ class MasterDataProvider:
         return payload if isinstance(payload, list) else []
 
     @classmethod
+    async def get_music_difficulties(cls, server: str) -> list[dict[str, Any]]:
+        payload = await cls.get_dataset(server, "musicDifficulties")
+        return payload if isinstance(payload, list) else []
+
+    @classmethod
     async def get_current_event(
         cls,
         server: str,

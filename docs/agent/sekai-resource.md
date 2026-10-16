@@ -27,6 +27,7 @@ from zhenxun.services.sekai_resource import (
 events = await master_data_provider.get_events("jp")
 cards = await master_data_provider.get_cards("jp")
 musics = await master_data_provider.get_musics("jp")
+music_difficulties = await master_data_provider.get_music_difficulties("jp")
 current = await master_data_provider.get_current_event("jp", fallback="next_first")
 ```
 
@@ -82,6 +83,7 @@ changed_results = await master_data_provider.probe_next_updates()
 | `honorGroups` | `get_honor_groups(server)` |
 | `stamps` | `get_stamps(server)` |
 | `musics` | `get_musics(server)` |
+| `musicDifficulties` | `get_music_difficulties(server)` |
 
 读取行为：
 - `get_dataset(server, dataset)` 会优先读内存缓存；本地文件不存在时会尝试自动更新对应区服。

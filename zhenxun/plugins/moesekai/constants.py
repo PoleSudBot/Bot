@@ -5,6 +5,7 @@ from pathlib import Path
 from zhenxun.configs.path_config import DATA_PATH
 
 MODULE_NAME = "moesekai"
+BINDING_NOTICE_PREFIX = "[南极] "
 
 SERVERS = ("cn", "jp", "tw")
 SERVER_SET = set(SERVERS)
@@ -54,6 +55,12 @@ def server_label(server: str | None) -> str:
     if not server:
         return "未设置"
     return SERVER_LABELS.get(server, server.upper())
+
+
+def format_binding_notice(message: str) -> str:
+    if message.startswith(BINDING_NOTICE_PREFIX.rstrip()):
+        return message
+    return f"{BINDING_NOTICE_PREFIX}{message}"
 
 
 def make_scope_key(group_id: str | None = None, *, platform: str | None = None) -> str:

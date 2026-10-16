@@ -5,6 +5,7 @@ import nonebot
 nonebot.init()
 
 from zhenxun.plugins.moesekai.b30 import (
+    ChartConstant,
     ConstantsTable,
     MusicMeta,
     calculate_best30,
@@ -151,3 +152,85 @@ def test_calculate_best30_counts_missing_constants():
     assert [entry.music_id for entry in result.entries] == [1]
     assert result.missing_constants_count == 1
     assert result.total_result_count == 2
+
+
+def test_calculate_best30_uses_official_level_only_when_community_row_is_missing():
+    table = ConstantsTable(
+        parse_constants_csv(
+            "Song,JP Name,Constant,Level,Note Count,Difficulty,Song ID,Notes\n"
+            "Community Song,,30.4,30,1000,Master,1,\n"
+        )
+    )
+    results = parse_user_music_results(
+        [
+            {
+                "musicId": 1,
+                "musicDifficultyType": "master",
+                "playResult": "all_perfect",
+                "fullComboFlg": True,
+                "fullPerfectFlg": True,
+            },
+            {
+                "musicId": 2,
+                "musicDifficultyType": "MA",
+                "playResult": "full_combo",
+                "fullComboFlg": True,
+                "fullPerfectFlg": False,
+            },
+        ]
+    )
+
+    def resolve_missing_constant(music_id: int, difficulty: str):
+        assert difficulty == "master"
+        return ChartConstant(
+            music_id=music_id,
+            difficulty=difficulty,
+            constant=99.0 if music_id == 1 else 33.0,
+            level=99 if music_id == 1 else 33,
+            level_label="99" if music_id == 1 else "33",
+            note_count=1234,
+        )
+
+    result = calculate_best30(
+        results,
+        table,
+        resolve_missing_constant=resolve_missing_constant,
+    )
+
+    assert [entry.music_id for entry in result.entries] == [2, 1]
+    official_entry, community_entry = result.entries
+    assert official_entry.constant == 33.0
+    assert official_entry.level == 33
+    assert official_entry.note_count == 1234
+    assert official_entry.user_rating == 32.0
+    assert community_entry.constant == 30.4
+    assert community_entry.level == 30
+    assert community_entry.note_count == 1000
+    assert result.missing_constants_count == 0
+
+
+def test_calculate_best30_rejects_invalid_official_level_fallback():
+    results = parse_user_music_results(
+        [
+            {
+                "musicId": 9,
+                "musicDifficultyType": "master",
+                "playResult": "all_perfect",
+                "fullComboFlg": True,
+                "fullPerfectFlg": True,
+            }
+        ]
+    )
+
+    result = calculate_best30(
+        results,
+        ConstantsTable([]),
+        resolve_missing_constant=lambda music_id, difficulty: ChartConstant(
+            music_id=music_id,
+            difficulty=difficulty,
+            constant=0,
+        ),
+    )
+
+    assert result.entries == []
+    assert result.missing_constants_count == 1

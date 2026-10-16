@@ -27,6 +27,63 @@ class FakeEvent:
         self.message_id = message_id
 
 
+@pytest.mark.parametrize(
+    "action",
+    ["bind", "unbind", "default_server", "visibility", "admin_query_binding"],
+)
+def test_binding_action_results_add_nickname_once(action: str):
+    assert router_module._format_action_result(action, "提示") == "[南极] 提示"
+    assert router_module._format_action_result(action, "[南极] 提示") == "[南极] 提示"
+
+
+def test_non_binding_action_result_keeps_original_text():
+    assert router_module._format_action_result("query_archive", "提示") == "提示"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parsed", "expected"),
+    [
+        (
+            ParsedCommand(
+                action="bind",
+                raw_text="绑定",
+                error="用法: 绑定 [区服] <游戏ID>",
+            ),
+            "[南极] 用法: 绑定 [区服] <游戏ID>",
+        ),
+        (
+            ParsedCommand(action="admin_query_binding", raw_text="pjsk 查询绑定"),
+            "[南极] 该指令仅超级用户可用",
+        ),
+    ],
+)
+async def test_binding_router_early_errors_add_nickname(
+    monkeypatch: pytest.MonkeyPatch,
+    parsed: ParsedCommand,
+    expected: str,
+):
+    sent: list[object] = []
+
+    async def fake_superuser(_bot, _event):
+        return False
+
+    async def fake_send_result(result, *, bot=None, event=None):
+        sent.append(result)
+
+    monkeypatch.setattr(router_module, "SUPERUSER", fake_superuser)
+    monkeypatch.setattr(router_module, "_send_result", fake_send_result)
+
+    await router_module._(
+        bot=SimpleNamespace(),
+        event=SimpleNamespace(),
+        session=SimpleNamespace(user=SimpleNamespace(id="123456"), group=None),
+        state={"moesekai_parsed_command": parsed},
+    )
+
+    assert sent == [expected]
+
+
 @pytest.mark.asyncio
 async def test_send_result_uses_single_native_onebot_message_for_image_text():
     bot = FakeBot()

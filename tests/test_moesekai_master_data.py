@@ -49,8 +49,9 @@ def test_sekai_resource_uses_dedicated_data_dir():
     assert RESOURCE_DATA_DIR.name == "sekai_resource"
 
 
-def test_master_dataset_keys_include_gachas():
+def test_master_dataset_keys_include_required_datasets():
     assert "gachas" in MASTER_DATASET_KEYS
+    assert "musicDifficulties" in MASTER_DATASET_KEYS
 
 
 def test_card_cutout_asset_paths_are_supported():
@@ -613,6 +614,34 @@ async def test_get_dataset_does_not_cache_missing_payload_on_failed_update(
     assert second == []
     assert update_calls == 2
     assert ("jp", "events") not in MasterDataService._cache
+
+
+@pytest.mark.asyncio
+async def test_get_music_difficulties_uses_dedicated_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = [
+        {
+            "musicId": 1,
+            "musicDifficulty": "master",
+            "playLevel": 26,
+            "totalNoteCount": 1147,
+        }
+    ]
+
+    async def fake_get_dataset(
+        _cls: type[MasterDataService], server: str, dataset: str
+    ):
+        assert (server, dataset) == ("jp", "musicDifficulties")
+        return payload
+
+    monkeypatch.setattr(
+        MasterDataService,
+        "get_dataset",
+        classmethod(fake_get_dataset),
+    )
+
+    assert await MasterDataService.get_music_difficulties("jp") == payload
 
 
 @pytest.mark.asyncio

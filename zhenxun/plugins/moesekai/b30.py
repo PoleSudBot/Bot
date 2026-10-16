@@ -142,6 +142,9 @@ def calculate_best30(
     results: list[UserMusicResult],
     table: ConstantsTable,
     resolve_meta: Callable[[int, str, ChartConstant], MusicMeta] | None = None,
+    resolve_missing_constant: Callable[
+        [int, str], ChartConstant | None
+    ] | None = None,
 ) -> B30Result:
     best = _best_user_music_results(results)
     entries: list[B30Entry] = []
@@ -154,7 +157,9 @@ def calculate_best30(
         if play_result not in {"AP", "FC"}:
             continue
         constant = table.get(result.music_id, result.difficulty)
-        if constant is None:
+        if constant is None and resolve_missing_constant:
+            constant = resolve_missing_constant(result.music_id, result.difficulty)
+        if constant is None or constant.constant <= 0:
             missing_constants += 1
             continue
         if play_result == "AP":

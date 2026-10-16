@@ -32,6 +32,7 @@ from ..b30 import (
     MusicMeta,
     b30_constants_provider,
     calculate_best30,
+    normalize_difficulty,
     parse_user_music_results,
 )
 from ..command_parser import ParsedCommand
@@ -42,6 +43,7 @@ from ..constants import (
     MODULE_NAME,
     SERVER_SET,
     STATE_DIR,
+    format_binding_notice,
     server_label,
 )
 from ..master_data import RegionUpdateResult
@@ -456,12 +458,16 @@ class MoeSekaiApplication:
                 fallback_jp=False,
             )
             if error or not resolved_server:
-                return "你还没有绑定任何账号，请先使用“绑定 [区服] <游戏ID>”"
+                return format_binding_notice(
+                    "你还没有绑定任何账号，请先使用“绑定 [区服] <游戏ID>”"
+                )
             binding = await get_user_binding(
                 platform, requester_user_id, resolved_server
             )
             if not binding:
-                return f"你还没有绑定{server_label(resolved_server)}账号"
+                return format_binding_notice(
+                    f"你还没有绑定{server_label(resolved_server)}账号"
+                )
             if error := await self._is_uid_blacklisted(
                 binding.server, binding.game_id, is_superuser
             ):
@@ -479,7 +485,7 @@ class MoeSekaiApplication:
             ignore_share=target_user_id == requester_user_id,
         )
         if error:
-            return error
+            return format_binding_notice(error) if error == "未绑定" else error
         try:
             return await self._capture_profile_image(binding.server, binding.game_id)
         except ScreenshotError as exc:
@@ -516,10 +522,14 @@ class MoeSekaiApplication:
             fallback_jp=False,
         )
         if error or not resolved_server:
-            return "你还没有绑定任何账号，请先使用“绑定 [区服] <游戏ID>”"
+            return format_binding_notice(
+                "你还没有绑定任何账号，请先使用“绑定 [区服] <游戏ID>”"
+            )
         binding = await get_user_binding(platform, requester_user_id, resolved_server)
         if not binding:
-            return f"你还没有绑定{server_label(resolved_server)}账号"
+            return format_binding_notice(
+                f"你还没有绑定{server_label(resolved_server)}账号"
+            )
         if error := await self._is_uid_blacklisted(
             binding.server, binding.game_id, is_superuser
         ):
@@ -556,9 +566,10 @@ class MoeSekaiApplication:
     async def _build_best30_image(self, server: str, game_id: str) -> bytes:
         suite_data = await suite_provider.get_b30_data(server, game_id)
         table = await b30_constants_provider.get_table()
-        musics, cards = await asyncio.gather(
+        musics, cards, music_difficulties = await asyncio.gather(
             master_data_provider.get_musics(server),
             master_data_provider.get_cards(server),
+            master_data_provider.get_music_difficulties(server),
         )
         music_map: dict[int, dict[str, Any]] = {}
         for music in musics:
@@ -571,6 +582,24 @@ class MoeSekaiApplication:
             if music_id > 0:
                 music_map[music_id] = music
 
+        official_constant_map: dict[tuple[int, str], ChartConstant] = {}
+        for item in music_difficulties:
+            if not isinstance(item, dict):
+                continue
+            music_id = self._to_int(item.get("musicId"))
+            difficulty = normalize_difficulty(str(item.get("musicDifficulty") or ""))
+            level = self._to_int(item.get("playLevel"))
+            if music_id <= 0 or not difficulty or level <= 0:
+                continue
+            official_constant_map[(music_id, difficulty)] = ChartConstant(
+                music_id=music_id,
+                difficulty=difficulty,
+                constant=float(level),
+                level=level,
+                level_label=str(level),
+                note_count=max(0, self._to_int(item.get("totalNoteCount"))),
+            )
+
         def resolve_meta(
             music_id: int, _difficulty: str, _constant: ChartConstant
         ) -> MusicMeta:
@@ -582,11 +611,19 @@ class MoeSekaiApplication:
                 published_at=int(music.get("publishedAt") or 0),
             )
 
-        # 先用 MasterData 补曲目信息，再集中补曲绘，保证定数计算和资源抓取解耦。
+        def resolve_missing_constant(
+            music_id: int, difficulty: str
+        ) -> ChartConstant | None:
+            return official_constant_map.get(
+                (music_id, normalize_difficulty(difficulty))
+            )
+
+        # 社区定数缺失时才使用官方等级，再集中补曲绘，保持计算与资源抓取解耦。
         result = calculate_best30(
             parse_user_music_results(suite_data.music_results),
             table,
             resolve_meta,
+            resolve_missing_constant,
         )
         avatar_uri, _missing_jacket_count = await asyncio.gather(
             self._build_best30_avatar_uri(server, suite_data, cards),
@@ -732,7 +769,9 @@ class MoeSekaiApplication:
             fallback_jp=True,
         )
         if error or not resolved_server:
-            return "请先绑定账号设置默认区服，或使用 pjsk update <cn|jp|tw> 显式指定区服"
+            return format_binding_notice(
+                "请先绑定账号设置默认区服，或使用 pjsk update <cn|jp|tw> 显式指定区服"
+            )
         result = await master_data_provider.update_region(resolved_server, force=True)
         await self._dispatch_manual_new_card_notifications(bot, [result])
         return result.to_message()
@@ -985,7 +1024,7 @@ class MoeSekaiApplication:
             fallback_jp=True,
         )
         if error or not resolved_server:
-            return "请先绑定账号或显式指定区服"
+            return format_binding_notice("请先绑定账号或显式指定区服")
         if action == "status":
             toggle = await get_group_feature_toggle(
                 platform=platform,
@@ -1027,7 +1066,7 @@ class MoeSekaiApplication:
             fallback_jp=True,
         )
         if error or not resolved_server:
-            return "请先绑定账号或显式指定区服"
+            return format_binding_notice("请先绑定账号或显式指定区服")
         if action == "status":
             toggle = await get_group_feature_toggle(
                 platform=platform,
@@ -1065,7 +1104,7 @@ class MoeSekaiApplication:
             fallback_jp=True,
         )
         if error or not resolved_server:
-            return "请先绑定账号或显式指定区服"
+            return format_binding_notice("请先绑定账号或显式指定区服")
         if subscribe:
             await upsert_user_feature_subscription(
                 platform=platform,
@@ -1206,7 +1245,7 @@ class MoeSekaiApplication:
             fallback_jp=True,
         )
         if error or not resolved_server:
-            return "请先绑定账号或显式指定区服"
+            return format_binding_notice("请先绑定账号或显式指定区服")
         lives = await master_data_provider.get_virtual_lives(resolved_server)
         target = None
         if live_id is not None:
@@ -2216,7 +2255,7 @@ class MoeSekaiApplication:
             fallback_jp=True,
         )
         if error or not resolved_server:
-            return "请先绑定账号或显式指定区服"
+            return format_binding_notice("请先绑定账号或显式指定区服")
         if not group_id:
             return "新卡上线提醒测试仅支持群聊"
 
