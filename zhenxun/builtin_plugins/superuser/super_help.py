@@ -30,6 +30,8 @@ async def build_html_help() -> bytes:
     return await create_plugin_help_image(
         plugin_types=[PluginType.SUPERUSER, PluginType.SUPER_AND_ADMIN],
         page_title="超级用户帮助手册",
+        style_name="landscape",
+        viewport={"width": 1920, "height": 1080},
     )
 
 

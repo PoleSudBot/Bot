@@ -461,6 +461,8 @@ class TableData(RenderableComponent):
     """表格头字段列表"""
     rows: list[list[TableCell]] = Field(default_factory=list)
     """数据行列表"""
+    divider_before_rows: set[int] = Field(default_factory=set)
+    """需要在顶部显示分割线的数据行索引"""
     column_alignments: list[Literal["left", "center", "right"]] | None = None
     """各列的对齐方式"""
     column_widths: list[str | int] | None = None
@@ -507,4 +509,9 @@ class TableData(RenderableComponent):
         """批量添加多行数据"""
         for row in rows:
             self.add_row(row)
+        return self
+
+    def add_divider(self) -> Self:
+        """在下一条数据行前添加分割线。"""
+        self.divider_before_rows.add(len(self.rows))
         return self

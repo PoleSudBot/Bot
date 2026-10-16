@@ -63,7 +63,11 @@ async def _get_task_category() -> dict:
 
 
 async def create_plugin_help_image(
-    plugin_types: list[PluginType], page_title: str
+    plugin_types: list[PluginType],
+    page_title: str,
+    *,
+    style_name: str | None = None,
+    viewport: dict[str, int] | None = None,
 ) -> bytes:
     """
     一个通用的函数，用于创建插件帮助图片。
@@ -71,6 +75,8 @@ async def create_plugin_help_image(
     参数:
         plugin_types: 要包含在帮助中的插件类型列表。
         page_title: 生成图片的标题。
+        style_name: 页面样式名称，用于让特定入口选择不同布局。
+        viewport: 截图视口大小，用于横屏布局扩大可用宽度。
 
     返回:
         bytes: 生成的图片字节流。
@@ -113,6 +119,7 @@ async def create_plugin_help_image(
 
     # 直接实例化 Data Model
     page_data = PluginHelpPageData(
+        style_name=style_name,
         bot_nickname=BotConfig.self_nickname,
         page_title=page_title,
         categories=categories,
@@ -121,6 +128,8 @@ async def create_plugin_help_image(
     cache_payload = {
         "plugin_types": sorted([plugin_type.value for plugin_type in plugin_types]),
         "page_title": page_title,
+        "style_name": style_name,
+        "viewport": viewport,
         "theme": Config.get_config("UI", "THEME", "default"),
         "page_data": page_data,
     }
@@ -128,13 +137,16 @@ async def create_plugin_help_image(
     if cached_image := await _PLUGIN_HELP_IMAGE_CACHE.get(cache_key):
         return cached_image
 
-    image_bytes = await ui.render(
-        page_data,
-        use_cache=True,
-        clip_selector=".container",
-        clip_padding=20,
-        disable_animations=True,
-    )
+    render_options = {
+        "clip_selector": ".container",
+        "clip_padding": 20,
+        "disable_animations": True,
+    }
+    if viewport:
+        # 横屏样式依赖更宽的浏览器视口，否则模板仍会按默认窄屏排成长图。
+        render_options["viewport"] = viewport
+
+    image_bytes = await ui.render(page_data, use_cache=True, **render_options)
     await _PLUGIN_HELP_IMAGE_CACHE.set(cache_key, image_bytes)
 
     return image_bytes
