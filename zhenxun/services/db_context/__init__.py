@@ -147,6 +147,8 @@ async def init():
                         for x in [
                             "already exists",
                             "duplicate column",
+                            "duplicate key",
+                            "duplicate name",
                             "已经存在",
                             "已存在",
                         ]
