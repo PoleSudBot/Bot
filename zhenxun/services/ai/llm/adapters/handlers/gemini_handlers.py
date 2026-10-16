@@ -49,6 +49,7 @@ from zhenxun.services.ai.core.options import (
     LLMEmbeddingConfig,
     ResponseFormat,
     TTSConfig,
+    normalize_reasoning_effort,
 )
 from zhenxun.services.ai.llm.adapters.base import (
     BaseAdapter,
@@ -123,7 +124,7 @@ class GeminiConfigMapper(ConfigMapper):
             params["toolConfig"] = {"functionCallingConfig": fc_config}
 
         if config.common.reasoning_effort and capabilities:
-            effort = str(config.common.reasoning_effort).lower()
+            effort = normalize_reasoning_effort(config.common.reasoning_effort)
             if capabilities.reasoning_effort_map:
                 effort = capabilities.reasoning_effort_map.get(effort, effort)
 

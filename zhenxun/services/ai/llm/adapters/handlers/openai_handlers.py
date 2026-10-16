@@ -46,6 +46,7 @@ from zhenxun.services.ai.core.options import (
     LLMEmbeddingConfig,
     ResponseFormat,
     StructuredOutputStrategy,
+    normalize_reasoning_effort,
 )
 from zhenxun.services.ai.llm.adapters.base import (
     BaseAdapter,
@@ -110,7 +111,7 @@ class OpenAIConfigMapper(ConfigMapper):
                     params["repetition_penalty"] = config.common.repetition_penalty
 
         if config.common.reasoning_effort:
-            effort = str(config.common.reasoning_effort).lower()
+            effort = normalize_reasoning_effort(config.common.reasoning_effort)
 
             if capabilities and capabilities.reasoning_effort_map:
                 effort = capabilities.reasoning_effort_map.get(effort, effort)

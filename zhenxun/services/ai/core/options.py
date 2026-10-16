@@ -104,6 +104,22 @@ class ReasoningEffort(str, Enum):
     """最大推理努力 (如 GLM / DeepSeek)"""
 
 
+def normalize_reasoning_effort(effort: ReasoningEffort | str | None) -> str:
+    """将思考强度归一为厂商 API 使用的小写字符串。
+
+    枚举成员取 `value`，避免 `str(枚举)` 带上类名得到 "ReasoningEffort.HIGH"
+    这类非法值（会被 Gemini 当作 thinkingLevel 拒绝并返回 400）。
+
+    参数:
+        effort: 思考强度枚举、字符串或 None
+
+    返回:
+        str: 小写思考强度字符串，如 "high"、"none"
+    """
+    value = effort.value if isinstance(effort, Enum) else effort
+    return str(value).lower()
+
+
 class ImageAspectRatio(str, Enum):
     """图像宽高比枚举"""
 
