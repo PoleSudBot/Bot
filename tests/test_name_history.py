@@ -133,6 +133,14 @@ def test_normalize_display_name_flattens_line_breaks():
     assert logic.normalize_display_name(" 小明\n今天\t想睡觉 ") == "小明 今天 想睡觉"
 
 
+def test_extract_member_snapshot_uses_onebot_card_and_nickname():
+    snapshot = logic.extract_member_snapshot(
+        {"card": " 群名片\nA ", "nickname": " QQ名\tA "}
+    )
+
+    assert snapshot == logic.SenderNameSnapshot(group_card="群名片 A", qq_name="QQ名 A")
+
+
 def test_build_group_info_defaults_does_not_override_custom_nickname():
     defaults = logic.build_group_info_defaults(
         logic.SenderNameSnapshot(group_card="群名片", qq_name="QQ名"),
@@ -141,6 +149,31 @@ def test_build_group_info_defaults_does_not_override_custom_nickname():
 
     assert defaults == {"platform": "qq", "user_name": "QQ名"}
     assert "nickname" not in defaults
+
+
+@pytest.mark.parametrize(
+    ("created_count", "cache_hit", "member_exists", "expected"),
+    [
+        (1, True, True, True),
+        (0, False, False, True),
+        (0, True, False, True),
+        (0, True, True, False),
+    ],
+)
+def test_should_sync_group_info_recovers_deleted_member_rows(
+    created_count: int,
+    cache_hit: bool,
+    member_exists: bool,
+    expected: bool,
+):
+    assert (
+        logic.should_sync_group_info(
+            created_count=created_count,
+            cache_hit=cache_hit,
+            member_exists=member_exists,
+        )
+        is expected
+    )
 
 
 @pytest.mark.asyncio
@@ -280,6 +313,30 @@ def test_build_history_display_data_keeps_empty_sections_user_friendly():
     assert data.sections[1].items[0].display_name == "QQ名"
     assert data.sections[1].items[0].is_current
     assert data.empty_text == "暂无记录。之后我看到名称变化时会慢慢记下来。"
+
+
+def test_build_history_display_data_does_not_mark_departed_member_current():
+    now = datetime(2026, 5, 14, 21, 3)
+    records = [
+        Record(logic.GROUP_CARD, "离群前群名片", now),
+        Record(logic.QQ_NAME, "离群前QQ名", now),
+    ]
+
+    data = logic.build_history_display_data(
+        records,
+        target_user_id="2000",
+        is_current_member=False,
+    )
+    text = logic.format_history_records(
+        records,
+        target_user_id="2000",
+        is_current_member=False,
+    )
+
+    assert all(
+        not item.is_current for section in data.sections for item in section.items
+    )
+    assert "（当前）" not in text
 
 
 def test_build_history_display_data_profile_name_prefers_current_group_card():
@@ -469,6 +526,7 @@ def test_plugin_entry_registers_avatar_refresh_callback_and_startup_import():
     tree = _load_plugin_tree()
     registered_refresh_callback = False
     schedules_startup_import = False
+    refreshes_avatar_on_query = False
 
     for node in ast.walk(tree):
         if (
@@ -483,9 +541,50 @@ def test_plugin_entry_registers_avatar_refresh_callback_and_startup_import():
             and node.func.id == "import_existing_avatar_cache"
         ):
             schedules_startup_import = True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "refresh_avatar_history_on_query"
+        ):
+            refreshes_avatar_on_query = True
 
     assert registered_refresh_callback
     assert schedules_startup_import
+    assert refreshes_avatar_on_query
+
+
+def test_plugin_entry_handles_member_lifecycle_and_uncached_member_queries():
+    tree = _load_plugin_tree()
+    imported_names: set[str] = set()
+    registers_notice_matcher = False
+    requests_uncached_member = False
+    validates_cached_member_row = False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported_names.update(alias.name for alias in node.names)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "on_notice"
+        ):
+            registers_notice_matcher = True
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr == "get_group_member_info":
+            requests_uncached_member = any(
+                keyword.arg == "no_cache"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in node.keywords
+            )
+        if node.func.attr == "exists":
+            validates_cached_member_row = True
+
+    assert {"GroupIncreaseNoticeEvent", "GroupDecreaseNoticeEvent"} <= imported_names
+    assert registers_notice_matcher
+    assert requests_uncached_member
+    assert validates_cached_member_row
 
 
 def test_avatar_history_model_and_group_name_migration_are_declared():
@@ -536,6 +635,9 @@ def test_avatar_persistence_uses_hashing_threading_and_limited_import():
     assert "IMPORT_CONCURRENCY = 2" in source
     assert "IMPORT_SLEEP_SECONDS = 0.05" in source
     assert "GroupNameHistory.filter(id__in=ids)" in source
+    assert "refresh_avatar_history_on_query" in source
+    assert "force_refresh=True" in source
+    assert 'source="history_query"' in source
 
 
 def test_resolve_query_target_supports_self_at_and_qq_number():

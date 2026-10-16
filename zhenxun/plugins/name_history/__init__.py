@@ -5,8 +5,15 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from nonebot import on_command, on_message, require
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message
+from nonebot import on_command, on_message, on_notice, require
+from nonebot.adapters import Bot
+from nonebot.adapters.onebot.v11 import (
+    GroupDecreaseNoticeEvent,
+    GroupIncreaseNoticeEvent,
+    GroupMessageEvent,
+    Message,
+)
+from nonebot.exception import ActionFailed
 from nonebot.params import CommandArg
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import is_type
@@ -31,11 +38,13 @@ from ._logic import (
     SenderNameSnapshot,
     build_history_display_data,
     build_group_info_defaults,
+    extract_member_snapshot,
     extract_sender_snapshot,
     format_history_records,
     normalize_name_type_filter,
     record_sender_snapshot,
     resolve_query_target,
+    should_sync_group_info,
 )
 from ._avatar import (
     AVATAR_HISTORY_LIMIT,
@@ -69,7 +78,7 @@ __plugin_meta__ = PluginMetadata(
     """.strip(),
     extra=PluginExtraData(
         author="k1yuyu",
-        version="0.2",
+        version="0.3",
         plugin_type=PluginType.NORMAL,
         menu_type="数据统计",
         commands=[
@@ -166,6 +175,18 @@ _record_matcher = on_message(
     block=False,
 )
 
+_group_increase_matcher = on_notice(
+    rule=is_type(GroupIncreaseNoticeEvent),
+    priority=1,
+    block=False,
+)
+
+_group_decrease_matcher = on_notice(
+    rule=is_type(GroupDecreaseNoticeEvent),
+    priority=1,
+    block=False,
+)
+
 _history_matcher = on_command(
     "历史昵称",
     aliases=_HISTORY_ALIASES,
@@ -223,6 +244,61 @@ async def _record_history_with_locks(
     return len(created_ids)
 
 
+async def _sync_member_snapshot(
+    *,
+    platform: str,
+    group_id: str,
+    user_id: str,
+    snapshot: SenderNameSnapshot,
+) -> int:
+    """记录名称并同步当前成员行，缓存命中时仍校验数据库行存在。"""
+    created_count = await _record_history_with_locks(
+        platform=platform,
+        group_id=group_id,
+        user_id=user_id,
+        snapshot=snapshot,
+    )
+    sync_key = (platform, group_id, user_id)
+    cache_hit = sync_key in _group_info_synced
+    member_exists = cache_hit and await GroupInfoUser.exists(
+        user_id=user_id,
+        group_id=group_id,
+    )
+    if not should_sync_group_info(
+        created_count=created_count,
+        cache_hit=cache_hit,
+        member_exists=member_exists,
+    ):
+        return 0
+
+    await GroupInfoUser.update_or_create(
+        user_id=user_id,
+        group_id=group_id,
+        defaults=build_group_info_defaults(snapshot, platform),
+    )
+    _group_info_synced.add(sync_key)
+    _trim_cache(_group_info_synced)
+    return created_count
+
+
+async def _get_current_member_snapshot(
+    bot: Bot,
+    *,
+    group_id: str,
+    user_id: str,
+) -> SenderNameSnapshot | None:
+    """绕过适配器缓存读取当前成员；查不到时视为不在群。"""
+    try:
+        member_info = await bot.get_group_member_info(
+            group_id=int(group_id),
+            user_id=int(user_id),
+            no_cache=True,
+        )
+    except ActionFailed:
+        return None
+    return extract_member_snapshot(member_info)
+
+
 async def _query_history_records(
     *,
     group_id: str,
@@ -275,6 +351,7 @@ async def _build_history_picture(
     avatar_uri: str,
     records: list[GroupNameHistory],
     name_type: str | None,
+    is_current_member: bool,
 ) -> bytes:
     """用 htmlrender 将历史昵称分区数据渲染成图片。"""
     avatar_history_items = await get_avatar_history_items(
@@ -300,6 +377,7 @@ async def _build_history_picture(
             item.avatar_uri for item in avatar_history_items[:AVATAR_HISTORY_LIMIT]
         ],
         avatar_records=avatar_history_items,
+        is_current_member=is_current_member,
     )
     return await template_to_pic(
         template_path=TEMPLATE_DIR,
@@ -325,24 +403,12 @@ async def _(event: GroupMessageEvent):
     group_id = str(event.group_id)
     user_id = str(event.user_id)
     snapshot = extract_sender_snapshot(event.sender)
-    created_count = await _record_history_with_locks(
+    created_count = await _sync_member_snapshot(
         platform=platform,
         group_id=group_id,
         user_id=user_id,
         snapshot=snapshot,
     )
-    sync_key = (platform, group_id, user_id)
-    if not created_count and sync_key in _group_info_synced:
-        return
-
-    # 历史表只在变化时新增，当前群成员信息则每次启动后至少刷新一次。
-    await GroupInfoUser.update_or_create(
-        user_id=user_id,
-        group_id=group_id,
-        defaults=build_group_info_defaults(snapshot, platform),
-    )
-    _group_info_synced.add(sync_key)
-    _trim_cache(_group_info_synced)
     logger.debug(
         f"记录名称变化 {created_count} 条",
         MODULE,
@@ -351,7 +417,37 @@ async def _(event: GroupMessageEvent):
     )
 
 
+@_group_increase_matcher.handle()
+async def _(bot: Bot, event: GroupIncreaseNoticeEvent):
+    """成员入群后立即采样名称，接口尚未就绪时由后续消息补偿。"""
+    if str(event.user_id) == str(bot.self_id):
+        return
+    platform = "qq"
+    group_id = str(event.group_id)
+    user_id = str(event.user_id)
+    _group_info_synced.discard((platform, group_id, user_id))
+    snapshot = await _get_current_member_snapshot(
+        bot,
+        group_id=group_id,
+        user_id=user_id,
+    )
+    if snapshot is not None:
+        await _sync_member_snapshot(
+            platform=platform,
+            group_id=group_id,
+            user_id=user_id,
+            snapshot=snapshot,
+        )
+
+
+@_group_decrease_matcher.handle()
+async def _(event: GroupDecreaseNoticeEvent):
+    """成员离群后失效同步状态，历史记录继续保留。"""
+    _group_info_synced.discard(("qq", str(event.group_id), str(event.user_id)))
+
+
 async def _send_history(
+    bot: Bot,
     event: GroupMessageEvent,
     args: Message,
     *,
@@ -362,9 +458,24 @@ async def _send_history(
     if target.error:
         await MessageUtils.build_message(target.error).finish(reply_to=True)
 
+    group_id = str(event.group_id)
+    snapshot = await _get_current_member_snapshot(
+        bot,
+        group_id=group_id,
+        user_id=target.user_id,
+    )
+    is_current_member = snapshot is not None
+    if snapshot is not None:
+        await _sync_member_snapshot(
+            platform="qq",
+            group_id=group_id,
+            user_id=target.user_id,
+            snapshot=snapshot,
+        )
+
     name_type = normalize_name_type_filter(name_type)
     records = await _query_history_records(
-        group_id=str(event.group_id),
+        group_id=group_id,
         user_id=target.user_id,
         name_type=name_type,
     )
@@ -373,6 +484,7 @@ async def _send_history(
         target_user_id=target.user_id,
         name_type=name_type,
         limit=HISTORY_LIMIT,
+        is_current_member=is_current_member,
     )
     logger.info("查看历史昵称", MODULE, target=target.user_id)
     try:
@@ -383,6 +495,7 @@ async def _send_history(
             avatar_uri=avatar_uri,
             records=records,
             name_type=name_type,
+            is_current_member=is_current_member,
         )
     except Exception as e:
         logger.warning(
@@ -407,18 +520,18 @@ async def _startup_import_avatar_cache():
 
 
 @_history_matcher.handle()
-async def _(event: GroupMessageEvent, args: Message = CommandArg()):
+async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
     """查看群名片和 QQ 名称的混合变化时间线。"""
-    await _send_history(event, args, name_type=None)
+    await _send_history(bot, event, args, name_type=None)
 
 
 @_group_card_matcher.handle()
-async def _(event: GroupMessageEvent, args: Message = CommandArg()):
+async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
     """只查看群名片变化。"""
-    await _send_history(event, args, name_type=GROUP_CARD)
+    await _send_history(bot, event, args, name_type=GROUP_CARD)
 
 
 @_qq_name_matcher.handle()
-async def _(event: GroupMessageEvent, args: Message = CommandArg()):
+async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
     """只查看 QQ 名称变化。"""
-    await _send_history(event, args, name_type=QQ_NAME)
+    await _send_history(bot, event, args, name_type=QQ_NAME)

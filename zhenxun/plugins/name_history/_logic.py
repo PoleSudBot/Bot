@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import re
@@ -113,6 +113,14 @@ def extract_sender_snapshot(sender: object) -> SenderNameSnapshot:
     )
 
 
+def extract_member_snapshot(member_info: Mapping[str, object]) -> SenderNameSnapshot:
+    """从 OneBot 群成员信息接口结果中提取名称快照。"""
+    return SenderNameSnapshot(
+        group_card=normalize_display_name(member_info.get("card")),
+        qq_name=normalize_display_name(member_info.get("nickname")),
+    )
+
+
 def choose_history_display_name(
     name_type: str,
     current_name: str | None,
@@ -182,6 +190,16 @@ def build_group_info_defaults(
     if snapshot.qq_name is not None:
         defaults["user_name"] = snapshot.qq_name
     return defaults
+
+
+def should_sync_group_info(
+    *,
+    created_count: int,
+    cache_hit: bool,
+    member_exists: bool,
+) -> bool:
+    """名称变化、未同步或成员行被删除时都需要刷新当前成员信息。"""
+    return bool(created_count) or not cache_hit or not member_exists
 
 
 def resolve_query_target(message: object, default_user_id: str) -> QueryTarget:
@@ -289,6 +307,7 @@ def build_history_display_data(
     avatar_uri_map: dict[str, str] | None = None,
     avatar_history: Sequence[str] | None = None,
     avatar_records: Sequence[AvatarHistoryRecord] | None = None,
+    is_current_member: bool = True,
 ) -> HistoryDisplayData:
     """把历史记录整理成图片模板和文本回退共用的分区展示数据。"""
     name_type = normalize_name_type_filter(name_type)
@@ -309,7 +328,7 @@ def build_history_display_data(
             HistoryDisplayItem(
                 time=_format_record_time(record.record_time),
                 display_name=record.display_name,
-                is_current=index == 0,
+                is_current=is_current_member and index == 0,
                 avatar_uri=_resolve_record_avatar_uri(
                     record, avatar_uri_map, avatar_records
                 ),
@@ -340,6 +359,7 @@ def format_history_records(
     target_user_id: str,
     name_type: str | None = None,
     limit: int = HISTORY_LIMIT,
+    is_current_member: bool = True,
 ) -> str:
     """把分区展示数据格式化为渲染失败时可读的文本回退。"""
     display_data = build_history_display_data(
@@ -347,6 +367,7 @@ def format_history_records(
         target_user_id=target_user_id,
         name_type=name_type,
         limit=limit,
+        is_current_member=is_current_member,
     )
     lines = [display_data.title]
     has_any_item = False
