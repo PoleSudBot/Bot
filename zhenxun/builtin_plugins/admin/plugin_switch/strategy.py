@@ -150,7 +150,14 @@ class TaskStrategy(SwitchStrategy):
         return "superuser_block_task"
 
     async def get_entity(self, name: str) -> Any:
-        return await TaskInfo.get_or_none(name=name)
+        if name.isdigit():
+            return await TaskInfo.get_or_none(id=int(name), load_status=True)
+
+        # 被动名可能留下旧插件残余，开关命令只应命中当前已加载的任务。
+        entity = await TaskInfo.get_or_none(name=name, load_status=True)
+        if entity:
+            return entity
+        return await TaskInfo.get_or_none(module=name, load_status=True)
 
     async def check_block_status(self, group_id: str, module: str) -> tuple[bool, bool]:
         is_su_blocked = await GroupConsole.is_superuser_block_task(group_id, module)
