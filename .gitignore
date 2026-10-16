@@ -195,3 +195,7 @@ AGENTS.override.md
 .bridge_runtime/
 sidecar/.runtime/
 sidecar/.env
+
+# uv.lock 由 uv 依据 pyproject.toml 与 plugins.txt 在本地重新生成，属于部署产物：
+# prod-setup 会重建、nbm update 会覆盖回当前 HEAD，入库后只会持续制造工作区漂移。
+uv.lock
