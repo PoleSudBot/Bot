@@ -16,6 +16,10 @@ from zhenxun.utils._image_template import ImageTemplate
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.manager.priority_manager import PriorityLifecycle
 from zhenxun.utils.platform import PlatformUtils
+from zhenxun.utils.welcome_message import (
+    load_welcome_message,
+    sanitize_welcome_message_data,
+)
 
 BASE_PATH = DATA_PATH / "welcome_message"
 BASE_PATH.mkdir(parents=True, exist_ok=True)
@@ -173,7 +177,7 @@ class Manager:
         return path
 
     @classmethod
-    async def save(cls, path: Path, message: UniMsg):
+    async def save(cls, path: Path, message: UniMsg) -> UniMessage:
         """保存群欢迎消息
 
         参数:
@@ -187,7 +191,7 @@ class Manager:
                 json_data = json.load(f)
         data = []
         is_at = False
-        for msg in message.dump(True):
+        for msg in sanitize_welcome_message_data(message.dump(True)):
             if msg["type"] == "image":
                 image_file = path / f"{uuid.uuid4()}.png"
                 await AsyncHttpx.download_file(msg["url"], image_file)
@@ -199,6 +203,7 @@ class Manager:
         json_data[str(uuid.uuid4())] = {"at": is_at, "status": True, "message": data}
         with file.open("w", encoding="utf8") as f:
             json.dump(json_data, f, ensure_ascii=False, indent=4)
+        return load_welcome_message(data)
 
     @classmethod
     async def get_group_message(
@@ -222,7 +227,7 @@ class Manager:
             key_list = list(json_data.keys())
             if idx < 0 or idx > len(key_list):
                 return None
-            return UniMessage().load(json_data[key_list[idx]]["message"])
+            return load_welcome_message(json_data[key_list[idx]]["message"])
         else:
             msg_list = []
             for i, uid in enumerate(json_data):
@@ -232,7 +237,7 @@ class Manager:
                         i,
                         "开启" if msg_data["status"] else "关闭",
                         "是" if msg_data["at"] else "否",
-                        str(UniMessage().load(msg_data["message"])),
+                        str(load_welcome_message(msg_data["message"])),
                     ]
                 )
             if not msg_list:
@@ -261,7 +266,7 @@ class Manager:
         key_list = list(json_data.keys())
         if idx < 0 or idx >= len(key_list):
             return None
-        old_msg = str(UniMessage().load(json_data[key_list[idx]]["message"]))
+        old_msg = str(load_welcome_message(json_data[key_list[idx]]["message"]))
         for msg in json_data[key_list[idx]]["message"]:
             if msg["type"] == "image" and msg["path"]:
                 image_path = Path(msg["path"])

@@ -6,7 +6,6 @@ import random
 
 from nonebot.adapters import Bot
 from nonebot.exception import ActionFailed
-from nonebot_plugin_alconna import At, UniMessage
 from nonebot_plugin_uninfo import Uninfo
 import ujson as json
 
@@ -25,6 +24,7 @@ from zhenxun.utils.manager.auto_greeting_manager import AutoGreetingManager
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.utils import FreqLimiter
+from zhenxun.utils.welcome_message import select_welcome_message
 
 base_config = Config.get("invite_manager")
 
@@ -274,11 +274,7 @@ class GroupManager:
             return
         cls._flmt.start_cd(session.group.id)
         if json_data := cls.__get_welcome_data(session):
-            key = random.choice([k for k in json_data.keys() if json_data[k]["status"]])
-            welcome_data = json_data[key]
-            msg_list = UniMessage().load(welcome_data["message"])
-            if welcome_data["at"]:
-                msg_list.insert(0, At("user", user_id))
+            msg_list = select_welcome_message(json_data, user_id)
             logger.info("发送群欢迎消息...", "入群检测", session=session)
             if msg_list:
                 await MessageUtils.build_message(msg_list).finish()  # type: ignore

@@ -22,6 +22,7 @@ from zhenxun.services.log import logger
 from zhenxun.utils.enum import PluginType
 from zhenxun.utils.message import MessageUtils
 from zhenxun.utils.rules import admin_check, ensure_group
+from zhenxun.utils.welcome_message import strip_welcome_command
 
 from .data_source import Manager
 
@@ -105,9 +106,9 @@ async def _(
     path = Manager.get_path(session)
     if not path:
         await MessageUtils.build_message("群组不存在...").finish()
-    message[0].text = message[0].text.replace(command[0], "").strip()
-    await Manager.save(path, message)
-    uni_msg = Text("设置欢迎消息成功: \n") + message
+    strip_welcome_command(message, command[0])
+    saved_message = await Manager.save(path, message)
+    uni_msg = Text("设置欢迎消息成功: \n") + saved_message
     await uni_msg.send()
     logger.info(f"设置群欢迎消息成功: {message}", command[0], session=session)
 
