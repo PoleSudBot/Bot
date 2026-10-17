@@ -85,6 +85,12 @@ _sign_matcher = on_alconna(
 )
 
 _sign_matcher.shortcut(
+    "qd",
+    command="签到",
+    prefix=True,
+)
+
+_sign_matcher.shortcut(
     "我的签到",
     command="签到",
     arguments=["--my"],
