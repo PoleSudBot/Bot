@@ -32,8 +32,8 @@ class FakeEvent:
     ["bind", "unbind", "default_server", "visibility", "admin_query_binding"],
 )
 def test_binding_action_results_add_nickname_once(action: str):
-    assert router_module._format_action_result(action, "提示") == "[南极] 提示"
-    assert router_module._format_action_result(action, "[南极] 提示") == "[南极] 提示"
+    assert router_module._format_action_result(action, "提示") == "提示（南极）"
+    assert router_module._format_action_result(action, "提示（南极）") == "提示（南极）"
 
 
 def test_non_binding_action_result_keeps_original_text():
@@ -50,11 +50,11 @@ def test_non_binding_action_result_keeps_original_text():
                 raw_text="绑定",
                 error="用法: 绑定 [区服] <游戏ID>",
             ),
-            "[南极] 用法: 绑定 [区服] <游戏ID>",
+            "用法: 绑定 [区服] <游戏ID>（南极）",
         ),
         (
             ParsedCommand(action="admin_query_binding", raw_text="pjsk 查询绑定"),
-            "[南极] 该指令仅超级用户可用",
+            "该指令仅超级用户可用（南极）",
         ),
     ],
 )

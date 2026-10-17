@@ -1491,7 +1491,7 @@ async def test_archive_and_best30_unbound_prompts_add_nickname(
         is_superuser=False,
     )
 
-    expected = "[南极] 你还没有绑定任何账号，请先使用“绑定 [区服] <游戏ID>”"
+    expected = "你还没有绑定任何账号，请先使用“绑定 [区服] <游戏ID>”（南极）"
     assert archive_result == expected
     assert best30_result == expected
 
