@@ -9,8 +9,13 @@ from tortoise import Tortoise
 
 nonebot.init()
 nonebot.require("nonebot_plugin_alconna")
+nonebot.require("nonebot_plugin_uninfo")
 
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message
+from nonebot.adapters.onebot.v11.event import Sender
 from nonebot_plugin_alconna import At, Match, UniMessage
+from nonebot_plugin_uninfo.model import Scene, SceneType, Session, User
+import nonebot_plugin_uninfo.params as uninfo_params
 
 from zhenxun.builtin_plugins.superuser.super_power import (
     _gold_adjust_matcher,
@@ -19,8 +24,10 @@ from zhenxun.builtin_plugins.superuser.super_power import (
 from zhenxun.builtin_plugins.wallet import (
     _command,
     _handle_transfer,
+    _matcher,
     _resolve_transfer_parts,
     _transfer_command,
+    _transfer_matcher,
 )
 from zhenxun.builtin_plugins.wallet import data_source as wallet_data_source
 from zhenxun.models.friend_user import FriendUser
@@ -141,9 +148,7 @@ async def test_transfer_handler_calls_ledger_and_stops_propagation(monkeypatch):
     monkeypatch.setattr(
         "zhenxun.builtin_plugins.wallet.MessageUtils.build_message", _FakeMessage
     )
-    matcher = SimpleNamespace(
-        stop_propagation=lambda: called.append(("stop", ()))
-    )
+    matcher = SimpleNamespace(stop_propagation=lambda: called.append(("stop", ())))
 
     at_user = At("user", "42")
     await _handle_transfer(
@@ -543,3 +548,168 @@ async def test_wallet_rank_fetches_unique_avatars_with_bounded_concurrency(
     assert rendered["rows"][0][1].src == avatar_path.as_uri()
     assert rendered["rows"][-1][1].src == avatar_path.as_uri()
     assert rendered["rows"][1][1].content == ""
+
+
+# ---------------------------------------------------------------------------
+# 真实响应器流程：Alconna 解析 + 依赖注入 + handler 一起跑
+#
+# 上面的用例都直接调用解析函数或 handler，绕过了响应器这一层，因此覆盖不到：
+#   * `钱包 @某人` 曾因为主命令缺少 At 参数，规则阶段直接返回 False，还被 Alconna
+#     当成“参数 [at] 匹配失败”的提示发出去，用户看不到任何余额；
+#   * matcher 依赖注入拿到类对象时，`matcher.stop_propagation()` 会抛 TypeError。
+# ---------------------------------------------------------------------------
+
+GROUP_ID = 178732453
+SELF_ID = "3072536533"
+SENDER_ID = "1163272259"
+TARGET_ID = "42"
+SENDER_GOLD = 500
+TARGET_GOLD = 100
+
+# 记录响应器发出的消息，供断言检查
+_sent: list[str] = []
+# alconna 以消息 id 为键缓存解析结果（LRU 16），每个用例必须用不同的 id
+_message_seq = 0
+
+
+class _FakeAdapter:
+    def get_name(self) -> str:
+        return "OneBot V11"
+
+
+class _FakeFetcher:
+    async def fetch(self, bot: Bot, event: GroupMessageEvent) -> Session:
+        return Session(
+            self_id=str(bot.self_id),
+            adapter="OneBot V11",
+            scope="QQClient",
+            scene=Scene(id=str(GROUP_ID), type=SceneType.GROUP, name="摸鱼同好会"),
+            user=User(id=SENDER_ID, name="tester"),
+        )
+
+
+async def _fake_call_api(api: str, **data):
+    if api in {"send_group_msg", "send_msg"}:
+        _sent.append(str(data.get("message")))
+        return {"message_id": 1}
+    if api == "get_group_member_info":
+        return {
+            "user_id": int(data.get("user_id", 0)),
+            "nickname": "tester",
+            "role": "member",
+        }
+    if api == "get_stranger_info":
+        return {"user_id": int(data.get("user_id", 0)), "nickname": "tester"}
+    if api == "get_login_info":
+        return {"user_id": int(SELF_ID), "nickname": "bot"}
+    return {}
+
+
+def _make_event(raw_message: str) -> GroupMessageEvent:
+    global _message_seq
+    _message_seq += 1
+    return GroupMessageEvent(
+        time=1792284103,
+        self_id=SELF_ID,
+        post_type="message",
+        sub_type="normal",
+        user_id=int(SENDER_ID),
+        message_type="group",
+        message_id=_message_seq,
+        group_id=GROUP_ID,
+        message=Message(raw_message),
+        raw_message=raw_message,
+        font=14,
+        sender=Sender(
+            user_id=int(SENDER_ID), nickname="tester", card="", role="member"
+        ),
+    )
+
+
+async def _run_matcher(
+    matcher_cls, raw_message: str, bot: Bot
+) -> tuple[bool, list[str], list[str]]:
+    """按真实流程跑一次响应器，返回 (规则结果, 规则阶段的提示, handler 的回复)。"""
+    event = _make_event(raw_message)
+    state: dict = {}
+    _sent.clear()
+    rule = await matcher_cls.check_rule(bot, event, state, None, {})
+    tips = list(_sent)
+    _sent.clear()
+    if rule:
+        await matcher_cls().run(bot, event, state)
+    replies = list(_sent)
+    _sent.clear()
+    return rule, tips, replies
+
+
+@pytest.fixture
+async def wallet_gold(wallet_db):
+    sender = await UserConsole.get_user(SENDER_ID, "qq")
+    target = await UserConsole.get_user(TARGET_ID, "qq")
+    sender.gold = SENDER_GOLD
+    target.gold = TARGET_GOLD
+    await sender.save(update_fields=["gold"])
+    await target.save(update_fields=["gold"])
+
+
+@pytest.fixture
+def wallet_bot(monkeypatch):
+    monkeypatch.setitem(
+        uninfo_params.INFO_FETCHER_MAPPING, "OneBot V11", _FakeFetcher()
+    )
+    bot = Bot(adapter=_FakeAdapter(), self_id=SELF_ID)
+    bot.call_api = _fake_call_api  # type: ignore[method-assign]
+    yield bot
+    _sent.clear()
+
+
+@pytest.mark.asyncio
+async def test_wallet_matcher_without_at_replies_own_balance(wallet_gold, wallet_bot):
+    rule, tips, replies = await _run_matcher(_matcher, "钱包", wallet_bot)
+
+    assert rule is True
+    assert tips == []
+    assert len(replies) == 1
+    assert f"你的钱包余额: {SENDER_GOLD}" in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_wallet_matcher_with_at_replies_target_balance(wallet_gold, wallet_bot):
+    rule, tips, replies = await _run_matcher(
+        _matcher, f"钱包 [CQ:at,qq={TARGET_ID}]", wallet_bot
+    )
+
+    assert rule is True, "带艾特的钱包指令必须仍然命中规则"
+    assert tips == [], "不应回“参数 [at] 匹配失败”"
+    assert len(replies) == 1
+    assert "用户" in replies[0]
+    assert f"的钱包余额: {TARGET_GOLD}" in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_wallet_matcher_balance_subcommand_with_at_replies_target_balance(
+    wallet_gold, wallet_bot
+):
+    rule, tips, replies = await _run_matcher(
+        _matcher, f"钱包 balance [CQ:at,qq={TARGET_ID}]", wallet_bot
+    )
+
+    assert rule is True
+    assert tips == []
+    assert len(replies) == 1
+    assert f"的钱包余额: {TARGET_GOLD}" in replies[0]
+
+
+@pytest.mark.asyncio
+async def test_transfer_matcher_with_at_moves_gold(wallet_gold, wallet_bot):
+    rule, tips, replies = await _run_matcher(
+        _transfer_matcher, f"转账100 [CQ:at,qq={TARGET_ID}]", wallet_bot
+    )
+
+    assert rule is True, "带艾特的转账指令必须仍然命中规则"
+    assert tips == []
+    assert len(replies) == 1
+    assert "转账成功" in replies[0]
+    assert (await UserConsole.get(user_id=SENDER_ID)).gold == SENDER_GOLD - 100
+    assert (await UserConsole.get(user_id=TARGET_ID)).gold == TARGET_GOLD + 100

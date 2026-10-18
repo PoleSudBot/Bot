@@ -34,10 +34,12 @@ __plugin_meta__ = PluginMetadata(
     usage="""
     指令：
         钱包
+        钱包@用户
         金币排行 [数量=10]
         金币总排行 [数量=10]
         转账<金额>@用户
         转账@用户<金额>
+        钱包 转账<金额>@用户
     """.strip(),
     extra=PluginExtraData(
         author="HibiKier",
@@ -62,6 +64,7 @@ __plugin_meta__ = PluginMetadata(
 _command = Alconna(
     "钱包",
     Option("--global", action=store_true),
+    Args["at_user?", At],
     Subcommand("balance", Args["at_user?", At], help_text="查看钱包余额"),
     Subcommand(
         "rank",
@@ -143,24 +146,31 @@ _transfer_matcher.shortcut(
 )
 
 
+async def _reply_balance(session: Uninfo, at_user: Match[At] | None) -> None:
+    """回复余额，带艾特时查询被艾特用户。"""
+    target = at_user.result if at_user is not None and at_user.available else None
+    gold = await get_balance(
+        target.target if target is not None else session.user.id,
+        PlatformUtils.get_platform(session),
+    )
+    if target is None:
+        await MessageUtils.build_message(f"你的钱包余额: {gold}").send(reply_to=True)
+    else:
+        await MessageUtils.build_message(["用户", target, f"的钱包余额: {gold}"]).send(
+            reply_to=True
+        )
+
+
 @_matcher.assign("$main")
-async def _(session: Uninfo, arparma: Arparma):
-    gold = await get_balance(session.user.id, PlatformUtils.get_platform(session))
+async def _(session: Uninfo, arparma: Arparma, at_user: Match[At]):
     logger.info("查看钱包", arparma.header_result, session=session)
-    await MessageUtils.build_message(f"你的钱包余额: {gold}").send(reply_to=True)
+    await _reply_balance(session, at_user)
 
 
 @_matcher.assign("balance")
 async def _(session: Uninfo, arparma: Arparma, at_user: Match[At]):
-    target_id = at_user.result.target if at_user.available else session.user.id
-    gold = await get_balance(target_id, PlatformUtils.get_platform(session))
     logger.info("查看钱包余额", arparma.header_result, session=session)
-    if at_user.available:
-        await MessageUtils.build_message(
-            ["用户", at_user.result, f"的钱包余额: {gold}"]
-        ).send(reply_to=True)
-    else:
-        await MessageUtils.build_message(f"你的钱包余额: {gold}").send(reply_to=True)
+    await _reply_balance(session, at_user)
 
 
 @_matcher.assign("rank")
