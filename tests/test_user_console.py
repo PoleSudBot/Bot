@@ -8,9 +8,15 @@ from tortoise import Tortoise
 
 nonebot.init()
 
+from zhenxun.services.cache import CacheRegistry, CacheRoot, cache_config
+from zhenxun.services.cache.config import CacheMode
+from zhenxun.services.data_access import DataAccess
+
+# isort: split
+# 服务栈需先于 models 导入：user_console 与 services 之间存在循环导入
 from zhenxun.models.user_console import UserConsole
 from zhenxun.models.user_gold_log import UserGoldLog
-from zhenxun.utils.enum import GoldHandle
+from zhenxun.utils.enum import CacheType, GoldHandle
 from zhenxun.utils.exception import InsufficientGold
 
 
@@ -34,6 +40,21 @@ async def user_console_db(tmp_path):
     UserConsole._uid_counter = None
     UserConsole._uid_lock = asyncio.Lock()
     await Tortoise.close_connections()
+
+
+@pytest.fixture
+def user_cache_memory():
+    """让 UserConsole 使用进程内存缓存，避免测试读写真实 Redis"""
+    cache_mode = cache_config.cache_mode
+    cache_backend = CacheRoot._cache_backend
+    cache_config.cache_mode = CacheMode.MEMORY
+    CacheRoot._cache_backend = None
+    CacheRegistry.register(CacheType.USERS, UserConsole)
+    CacheRoot.enable()
+    yield
+    cache_config.cache_mode = cache_mode
+    CacheRoot._cache_backend = cache_backend
+    CacheRoot.enabled = cache_mode != CacheMode.NONE
 
 
 @pytest.mark.asyncio
@@ -214,3 +235,39 @@ async def test_admin_gold_adjustments_allow_negative_balances(user_console_db):
     ]
     with pytest.raises(ValueError, match="金币调整数量不能为 0"):
         await UserConsole.adjust_gold("managed", 0, "superuser:adjust:operator", "qq")
+
+
+@pytest.mark.asyncio
+async def test_gold_mutations_invalidate_auth_cache(user_cache_memory, user_console_db):
+    """金币变动后鉴权路径(DataAccess 缓存)必须读到新余额"""
+    dao = DataAccess(UserConsole)
+    user = await UserConsole.get_user("cached", "qq")
+    user.gold = 100
+    await user.save(update_fields=["gold"])
+    # 鉴权路径的读取会写入缓存
+    assert (await dao.safe_get_or_none(user_id="cached")).gold == 100
+
+    # 签到 / 加金币
+    await UserConsole.add_gold("cached", 20, "sign_in", "qq")
+    assert (await dao.safe_get_or_none(user_id="cached")).gold == 120
+
+    # 插件扣费
+    await UserConsole.reduce_gold("cached", 30, GoldHandle.PLUGIN, "test:cost", "qq")
+    assert (await dao.safe_get_or_none(user_id="cached")).gold == 90
+
+    # 钱包转账：转出与转入双方都要失效
+    payer = await UserConsole.get_user("cached_payer", "qq")
+    payer.gold = 50
+    await payer.save(update_fields=["gold"])
+    assert (await dao.safe_get_or_none(user_id="cached_payer")).gold == 50
+    assert (await dao.safe_get_or_none(user_id="cached")).gold == 90
+
+    await UserConsole.transfer_gold("cached_payer", "cached", 10, "qq")
+    assert (await dao.safe_get_or_none(user_id="cached_payer")).gold == 40
+    assert (await dao.safe_get_or_none(user_id="cached")).gold == 100
+
+    # 管理员设置 / 调整
+    await UserConsole.set_gold("cached", 7, "superuser:set:operator", "qq")
+    assert (await dao.safe_get_or_none(user_id="cached")).gold == 7
+    await UserConsole.adjust_gold("cached", 3, "superuser:adjust:operator", "qq")
+    assert (await dao.safe_get_or_none(user_id="cached")).gold == 10

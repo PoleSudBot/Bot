@@ -3,7 +3,6 @@ from typing import ClassVar
 
 from tortoise import fields
 from tortoise.exceptions import IntegrityError
-from tortoise.expressions import F
 from tortoise.transactions import in_transaction
 
 from zhenxun.services.db_context import Model
@@ -119,11 +118,18 @@ class UserConsole(Model):
             raise ValueError("增加金币数量必须为正整数")
         await cls.get_or_create_user(user_id=user_id, platform=platform)
         async with in_transaction() as connection:
-            updated = await cls.filter(user_id=user_id).using_db(connection).update(
-                gold=F("gold") + gold
+            # 余额必须通过 save() 更新：只有 Model.save 会清除 UserConsole 缓存，
+            # 用 QuerySet.update 会让鉴权一直读到变动前的旧金币
+            user = (
+                await cls.filter(user_id=user_id)
+                .using_db(connection)
+                .select_for_update()
+                .first()
             )
-            if not updated:
+            if not user:
                 raise RuntimeError(f"金币账户不存在: {user_id}")
+            user.gold += gold
+            await user.save(using_db=connection, update_fields=["gold"])
             await UserGoldLog.create(
                 using_db=connection,
                 user_id=user_id,
@@ -158,13 +164,19 @@ class UserConsole(Model):
             raise ValueError("扣除金币数量必须为正整数")
         await cls.get_or_create_user(user_id=user_id, platform=platform)
         async with in_transaction() as connection:
-            updated = (
-                await cls.filter(user_id=user_id, gold__gte=gold)
+            # 同 add_gold：走 save() 才会清除缓存，避免签到/消费后鉴权仍读旧金币
+            user = (
+                await cls.filter(user_id=user_id)
                 .using_db(connection)
-                .update(gold=F("gold") - gold)
+                .select_for_update()
+                .first()
             )
-            if not updated:
+            if not user:
+                raise RuntimeError(f"金币账户不存在: {user_id}")
+            if user.gold < gold:
                 raise InsufficientGold()
+            user.gold -= gold
+            await user.save(using_db=connection, update_fields=["gold"])
             await UserGoldLog.create(
                 using_db=connection,
                 user_id=user_id,
