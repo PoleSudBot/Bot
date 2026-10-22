@@ -1169,6 +1169,287 @@ async def test_dispatch_live_reminders_skips_when_notification_record_exists(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_live_reminders_merges_same_server_reminders_into_one_message(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = datetime.now()
+    first_start = now + timedelta(minutes=2, seconds=10)
+    second_start = now + timedelta(minutes=2, seconds=40)
+    expected_first_start = datetime.fromtimestamp(
+        int(first_start.timestamp() * 1000) / 1000
+    )
+    expected_second_start = datetime.fromtimestamp(
+        int(second_start.timestamp() * 1000) / 1000
+    )
+    sent: list[dict[str, object]] = []
+    records: list[tuple[str, str]] = []
+    merged_calls: list[list[int]] = []
+
+    def _live(live_id: int, name: str, start: datetime) -> dict[str, object]:
+        return {
+            "id": live_id,
+            "name": name,
+            "virtualLiveSchedules": [
+                {"startAt": int(start.timestamp() * 1000)},
+                {"startAt": int((start + timedelta(minutes=30)).timestamp() * 1000)},
+            ],
+        }
+
+    async def fake_toggles(*, feature_name: str):
+        assert feature_name == service_module.FEATURE_LIVE_REMINDER
+        return [SimpleNamespace(platform="qq", group_id="group-a", server="jp")]
+
+    async def fake_get_virtual_lives(server: str):
+        assert server == "jp"
+        return [_live(100, "Live A", first_start), _live(101, "Live B", second_start)]
+
+    async def fake_has_notification_record(**_kwargs):
+        return False
+
+    async def fake_list_subscribers(**_kwargs):
+        return [SimpleNamespace(user_id="1001"), SimpleNamespace(user_id="1002")]
+
+    async def fail_build_live_message(*_args, **_kwargs):
+        raise AssertionError("同一区服多场同时到期时不应逐场构建单场提醒")
+
+    async def fake_build_merged_live_message(server: str, items, *, now):
+        assert server == "jp"
+        merged_calls.append([int(item.live["id"]) for item in items])
+        return service_module.UniMessage([service_module.Image(raw=b"merged-bytes")])
+
+    async def fake_send_message(_bot, _user_id, group_id: str, message):
+        sent.append({"group_id": group_id, "message": message})
+
+    async def fake_create_notification_record(*, server: str, record_key: str, **_kwargs):
+        records.append((server, record_key))
+
+    monkeypatch.setattr(
+        service_module,
+        "list_enabled_group_feature_toggles",
+        fake_toggles,
+    )
+    monkeypatch.setattr(
+        service_module.master_data_provider,
+        "get_virtual_lives",
+        fake_get_virtual_lives,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "has_notification_record",
+        fake_has_notification_record,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "list_user_feature_subscriptions",
+        fake_list_subscribers,
+    )
+    monkeypatch.setattr(
+        service_module.moesekai_app,
+        "_build_live_message",
+        fail_build_live_message,
+    )
+    monkeypatch.setattr(
+        service_module.moesekai_app,
+        "_build_merged_live_message",
+        fake_build_merged_live_message,
+    )
+    monkeypatch.setattr(
+        service_module.PlatformUtils,
+        "send_message",
+        fake_send_message,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_notification_record",
+        fake_create_notification_record,
+    )
+
+    await service_module.moesekai_app.dispatch_live_reminders(bot=SimpleNamespace())
+
+    assert merged_calls == [[100, 101]]
+    assert len(sent) == 1
+    assert sent[0]["group_id"] == "group-a"
+    segments = list(sent[0]["message"])
+    assert [segment.type for segment in segments] == ["image", "text", "at", "text", "at"]
+    assert segments[1].text == "\n"
+    assert segments[2].target == "1001"
+    assert segments[3].text == " "
+    assert segments[4].target == "1002"
+    assert records == [
+        ("jp", f"100:first:{expected_first_start.isoformat()}"),
+        ("jp", f"101:first:{expected_second_start.isoformat()}"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_live_reminders_does_not_merge_across_servers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = datetime.now()
+    jp_start = now + timedelta(minutes=2, seconds=10)
+    cn_start = now + timedelta(minutes=2, seconds=20)
+    build_calls: list[str] = []
+    sent_groups: list[str] = []
+
+    def _live(live_id: int, name: str, start: datetime) -> dict[str, object]:
+        return {
+            "id": live_id,
+            "name": name,
+            "virtualLiveSchedules": [
+                {"startAt": int(start.timestamp() * 1000)},
+                {"startAt": int((start + timedelta(minutes=30)).timestamp() * 1000)},
+            ],
+        }
+
+    async def fake_toggles(*, feature_name: str):
+        assert feature_name == service_module.FEATURE_LIVE_REMINDER
+        return [
+            SimpleNamespace(platform="qq", group_id="group-a", server="jp"),
+            SimpleNamespace(platform="qq", group_id="group-a", server="cn"),
+        ]
+
+    async def fake_get_virtual_lives(server: str):
+        if server == "jp":
+            return [_live(100, "日服 Live", jp_start)]
+        return [_live(200, "国服 Live", cn_start)]
+
+    async def fake_has_notification_record(**_kwargs):
+        return False
+
+    async def fake_list_subscribers(**_kwargs):
+        return []
+
+    async def fake_build_live_message(server: str, _live_data: dict, **_kwargs):
+        build_calls.append(server)
+        return service_module.UniMessage([service_module.Image(raw=b"single-bytes")])
+
+    async def fail_build_merged_live_message(*_args, **_kwargs):
+        raise AssertionError("不同区服的提醒不应合并")
+
+    async def fake_send_message(_bot, _user_id, group_id: str, _message):
+        sent_groups.append(group_id)
+
+    async def fake_create_notification_record(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        service_module,
+        "list_enabled_group_feature_toggles",
+        fake_toggles,
+    )
+    monkeypatch.setattr(
+        service_module.master_data_provider,
+        "get_virtual_lives",
+        fake_get_virtual_lives,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "has_notification_record",
+        fake_has_notification_record,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "list_user_feature_subscriptions",
+        fake_list_subscribers,
+    )
+    monkeypatch.setattr(
+        service_module.moesekai_app,
+        "_build_live_message",
+        fake_build_live_message,
+    )
+    monkeypatch.setattr(
+        service_module.moesekai_app,
+        "_build_merged_live_message",
+        fail_build_merged_live_message,
+    )
+    monkeypatch.setattr(
+        service_module.PlatformUtils,
+        "send_message",
+        fake_send_message,
+    )
+    monkeypatch.setattr(
+        service_module,
+        "create_notification_record",
+        fake_create_notification_record,
+    )
+
+    await service_module.moesekai_app.dispatch_live_reminders(bot=SimpleNamespace())
+
+    assert build_calls == ["jp", "cn"]
+    assert sent_groups == ["group-a", "group-a"]
+
+
+@pytest.mark.asyncio
+async def test_build_merged_live_message_renders_single_card_with_all_schedules(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = datetime.now()
+    first_start = now + timedelta(minutes=3)
+    second_start = now + timedelta(minutes=4, seconds=20)
+    rendered: list[object] = []
+
+    async def fake_render_reminder_card(view_model):
+        rendered.append(view_model)
+        return b"merged-image"
+
+    monkeypatch.setattr(
+        service_module,
+        "render_reminder_card",
+        fake_render_reminder_card,
+    )
+
+    items = [
+        service_module._LiveReminderDueItem(
+            live={"id": 100, "name": "Live A"},
+            checkpoint=service_module._LiveReminderCheckpoint(
+                stage="first",
+                title="Live 即将开始",
+                start_time=first_start,
+                remind_at=now,
+                remaining_count=2,
+            ),
+            record_key="100:first:x",
+        ),
+        service_module._LiveReminderDueItem(
+            live={"id": 101, "name": "Live B"},
+            checkpoint=service_module._LiveReminderCheckpoint(
+                stage="first",
+                title="Live 即将结束",
+                start_time=second_start,
+                remind_at=now,
+                remaining_count=None,
+            ),
+            record_key="101:first:y",
+        ),
+    ]
+
+    message = await service_module.moesekai_app._build_merged_live_message(
+        "jp",
+        items,
+        now=now,
+    )
+
+    assert len(rendered) == 1
+    view_model = rendered[0]
+    assert view_model.title == "Live 提醒"
+    assert view_model.subtitle == "日服 · 共 2 场"
+    assert view_model.banner is None
+    assert view_model.lines == [
+        (
+            f"【Live 即将开始】Live A｜"
+            f"{service_module.moesekai_app._format_live_start_time(first_start)}"
+            "（3分钟后）｜剩余 2 场"
+        ),
+        (
+            f"【Live 即将结束】Live B｜"
+            f"{service_module.moesekai_app._format_live_start_time(second_start)}"
+            "（5分钟后）"
+        ),
+    ]
+    assert [segment.type for segment in message] == ["image"]
+
+
+@pytest.mark.asyncio
 async def test_handle_test_new_card_reminder_defaults_to_jp_when_unbound(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1217,6 +1498,51 @@ async def test_handle_test_new_card_reminder_defaults_to_jp_when_unbound(
 
     assert result is None
     assert captured["keys"] == ["test:summary", "test:card:100", "test:stamp:200"]
+
+
+@pytest.mark.asyncio
+async def test_handle_test_new_card_reminder_sends_newest_cards_in_ascending_order(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+
+    async def fake_get_cards(server: str):
+        assert server == "jp"
+        return [
+            {"id": card_id, "releaseAt": card_id}
+            for card_id in range(1, service_module.NEW_CARD_TEST_SCAN_LIMIT + 2)
+        ]
+
+    async def fake_get_stamps(server: str):
+        assert server == "jp"
+        return []
+
+    async def fake_send_test_batches(*, bot, group_id: str, server: str, revision: str | None, specs):
+        captured["keys"] = [spec.key for spec in specs]
+        return True
+
+    monkeypatch.setattr(service_module.master_data_provider, "get_cards", fake_get_cards)
+    monkeypatch.setattr(service_module.master_data_provider, "get_stamps", fake_get_stamps)
+    monkeypatch.setattr(
+        service_module.moesekai_app,
+        "_send_test_new_card_batches",
+        fake_send_test_batches,
+    )
+
+    result = await service_module.moesekai_app.handle_test_new_card_reminder(
+        bot=SimpleNamespace(),
+        group_id="178732453",
+        platform="qq",
+        user_id="123456",
+        server="jp",
+    )
+
+    assert result is None
+    newest_ids = list(range(2, service_module.NEW_CARD_TEST_SCAN_LIMIT + 2))
+    assert captured["keys"] == [
+        "test:summary",
+        *(f"test:card:{card_id}" for card_id in sorted(newest_ids)),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2471,7 +2797,7 @@ async def test_handle_test_new_card_reminder_explicit_ids_do_not_include_stamps(
     )
 
     assert result is None
-    assert captured["keys"] == ["test:summary", "test:card:1007", "test:card:1006"]
+    assert captured["keys"] == ["test:summary", "test:card:1006", "test:card:1007"]
 
 
 @pytest.mark.asyncio
@@ -3009,7 +3335,7 @@ async def test_dispatch_new_card_notifications_failed_group_does_not_block_other
         }
 
     async def fake_batches(*, server: str, specs):
-        assert [spec.key for spec in specs] == [summary_key, card_2_key, card_1_key]
+        assert [spec.key for spec in specs] == [summary_key, card_1_key, card_2_key]
         yield [
             service_module._NewCardReminderPreparedItem(
                 key=summary_key,
@@ -3018,17 +3344,17 @@ async def test_dispatch_new_card_notifications_failed_group_does_not_block_other
                 estimated_bytes=1,
             ),
             service_module._NewCardReminderPreparedItem(
-                key=card_2_key,
+                key=card_1_key,
                 kind="card",
-                message="card-101",
+                message="card-100",
                 estimated_bytes=1,
             ),
         ]
         yield [
             service_module._NewCardReminderPreparedItem(
-                key=card_1_key,
+                key=card_2_key,
                 kind="card",
-                message="card-100",
+                message="card-101",
                 estimated_bytes=1,
             )
         ]
@@ -3081,8 +3407,8 @@ async def test_dispatch_new_card_notifications_failed_group_does_not_block_other
     assert plain_calls == [
         ("group-a", [summary_key], 1),
         ("group-b", [summary_key], 1),
-        ("group-a", [card_2_key, card_1_key], 2),
-        ("group-b", [card_2_key, card_1_key], 2),
+        ("group-a", [card_1_key, card_2_key], 2),
+        ("group-b", [card_1_key, card_2_key], 2),
     ]
 
 
@@ -3323,3 +3649,34 @@ def test_build_new_card_item_specs_skips_summary_when_only_retrying_missing_item
     )
 
     assert [spec.key for spec in specs] == [f"{base_key}:card:101", f"{base_key}:stamp:200"]
+
+
+def test_build_new_card_item_specs_orders_cards_and_stamps_forward():
+    base_key = "rev-order"
+    pending_keys = {
+        f"{base_key}:summary",
+        *(f"{base_key}:card:{card_id}" for card_id in (100, 101, 102)),
+        f"{base_key}:stamp:200",
+        f"{base_key}:stamp:201",
+    }
+
+    specs = service_module.moesekai_app._build_new_card_item_specs(
+        server="jp",
+        revision=base_key,
+        base_key=base_key,
+        cards=[_auto_card(102), _auto_card(100), _auto_card(101)],
+        stamps=[
+            {"id": 201, "seq": 2},
+            {"id": 200, "seq": 1},
+        ],
+        pending_keys=pending_keys,
+    )
+
+    assert [spec.key for spec in specs] == [
+        f"{base_key}:summary",
+        f"{base_key}:card:100",
+        f"{base_key}:card:101",
+        f"{base_key}:card:102",
+        f"{base_key}:stamp:200",
+        f"{base_key}:stamp:201",
+    ]

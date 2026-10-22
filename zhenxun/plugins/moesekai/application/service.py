@@ -124,6 +124,13 @@ class _LiveReminderCheckpoint:
     remaining_count: int | None
 
 
+@dataclass(frozen=True)
+class _LiveReminderDueItem:
+    live: dict[str, Any]
+    checkpoint: _LiveReminderCheckpoint
+    record_key: str
+
+
 class MoeSekaiApplication:
     def __init__(self) -> None:
         self._shared_capture_tasks: dict[str, asyncio.Task[bytes]] = {}
@@ -1159,6 +1166,39 @@ class MoeSekaiApplication:
         )
         return UniMessage([Image(raw=image)])
 
+    async def _build_merged_live_message(
+        self,
+        server: str,
+        items: list[_LiveReminderDueItem],
+        *,
+        now: datetime,
+    ) -> UniMessage:
+        # 同一区服多场 live 同时到期时合并成一张图片发送，避免逐个提醒刷屏。
+        lines: list[str] = []
+        for item in items:
+            name = str(item.live.get("name", "")).strip() or "Live"
+            start_text = self._format_live_start_time(item.checkpoint.start_time)
+            countdown_minutes = self._get_live_countdown_minutes(
+                now=now,
+                start_time=item.checkpoint.start_time,
+            )
+            line = (
+                f"【{item.checkpoint.title}】{name}｜{start_text}"
+                f"（{countdown_minutes}分钟后）"
+            )
+            if item.checkpoint.remaining_count:
+                line += f"｜剩余 {item.checkpoint.remaining_count} 场"
+            lines.append(line)
+        image = await render_reminder_card(
+            ReminderCardViewModel(
+                title="Live 提醒",
+                subtitle=f"{server_label(server)} · 共 {len(items)} 场",
+                lines=lines,
+                accent="Live Reminder",
+            )
+        )
+        return UniMessage([Image(raw=image)])
+
     def _collect_live_schedule_starts(self, live: dict[str, Any]) -> list[datetime]:
         starts: list[datetime] = []
         for item in live.get("virtualLiveSchedules", []):
@@ -1853,7 +1893,8 @@ class MoeSekaiApplication:
                     },
                 )
             )
-        for card in sorted(cards, key=self._new_card_sort_key, reverse=True):
+        # 新卡按 (releaseAt, id) 升序推送：同批更新的卡牌会按序号 100/101/102 依次展示。
+        for card in sorted(cards, key=self._new_card_sort_key):
             card_key = self._new_card_card_record_key(base_key, card.get("id", 0))
             if card_key in pending_keys:
                 specs.append(
@@ -1863,7 +1904,8 @@ class MoeSekaiApplication:
                         payload=card,
                     )
                 )
-        for stamp in sorted(stamps, key=self._new_stamp_sort_key, reverse=True):
+        # 表情同样按 (seq, id) 升序，和卡牌批次保持一致的“正向顺序”语义。
+        for stamp in sorted(stamps, key=self._new_stamp_sort_key):
             stamp_key = self._new_card_stamp_record_key(base_key, stamp.get("id", 0))
             if stamp_key in pending_keys:
                 specs.append(
@@ -2617,6 +2659,9 @@ class MoeSekaiApplication:
         )
         for toggle in toggles:
             lives = await master_data_provider.get_virtual_lives(toggle.server)
+            # 合并只发生在同一个群的同一个区服：同区服多场 live 同时到期才合成一张图，
+            # 不同区服仍然各自发送，避免把区服语义混在一张提醒图里。
+            due_items: list[_LiveReminderDueItem] = []
             for live in lives:
                 for checkpoint in self._build_live_reminder_checkpoints(live):
                     if not self._is_live_reminder_due(
@@ -2636,39 +2681,63 @@ class MoeSekaiApplication:
                         record_key=record_key,
                     ):
                         continue
-                    subscribers = await list_user_feature_subscriptions(
-                        platform=toggle.platform,
-                        group_id=toggle.group_id,
-                        feature_name=FEATURE_LIVE_REMINDER,
-                        server=toggle.server,
+                    due_items.append(
+                        _LiveReminderDueItem(
+                            live=live,
+                            checkpoint=checkpoint,
+                            record_key=record_key,
+                        )
                     )
-                    reminder = await self._build_live_message(
-                        toggle.server,
-                        live,
-                        start_time=checkpoint.start_time,
-                        countdown_minutes=self._get_live_countdown_minutes(
-                            now=now,
-                            start_time=checkpoint.start_time,
-                        ),
-                        title=checkpoint.title,
-                        remaining_count=checkpoint.remaining_count,
+            if not due_items:
+                continue
+            due_items.sort(
+                key=lambda item: (
+                    item.checkpoint.start_time,
+                    self._to_int(item.live.get("id")),
+                )
+            )
+            if len(due_items) == 1:
+                item = due_items[0]
+                reminder = await self._build_live_message(
+                    toggle.server,
+                    item.live,
+                    start_time=item.checkpoint.start_time,
+                    countdown_minutes=self._get_live_countdown_minutes(
+                        now=now,
+                        start_time=item.checkpoint.start_time,
+                    ),
+                    title=item.checkpoint.title,
+                    remaining_count=item.checkpoint.remaining_count,
+                )
+            else:
+                reminder = await self._build_merged_live_message(
+                    toggle.server,
+                    due_items,
+                    now=now,
+                )
+            subscribers = await list_user_feature_subscriptions(
+                platform=toggle.platform,
+                group_id=toggle.group_id,
+                feature_name=FEATURE_LIVE_REMINDER,
+                server=toggle.server,
+            )
+            if subscribers:
+                reminder += UniMessage([Text("\n")])
+                for index, subscription in enumerate(subscribers):
+                    reminder += UniMessage(
+                        [At(flag="user", target=subscription.user_id)]
                     )
-                    if subscribers:
-                        reminder += UniMessage([Text("\n")])
-                        for index, subscription in enumerate(subscribers):
-                            reminder += UniMessage(
-                                [At(flag="user", target=subscription.user_id)]
-                            )
-                            if index < len(subscribers) - 1:
-                                reminder += UniMessage([Text(" ")])
-                    await PlatformUtils.send_message(bot, None, toggle.group_id, reminder)
-                    await create_notification_record(
-                        platform=toggle.platform,
-                        group_id=toggle.group_id,
-                        feature_name=FEATURE_LIVE_REMINDER,
-                        server=toggle.server,
-                        record_key=record_key,
-                    )
+                    if index < len(subscribers) - 1:
+                        reminder += UniMessage([Text(" ")])
+            await PlatformUtils.send_message(bot, None, toggle.group_id, reminder)
+            for item in due_items:
+                await create_notification_record(
+                    platform=toggle.platform,
+                    group_id=toggle.group_id,
+                    feature_name=FEATURE_LIVE_REMINDER,
+                    server=toggle.server,
+                    record_key=item.record_key,
+                )
 
 
 moesekai_app = MoeSekaiApplication()
