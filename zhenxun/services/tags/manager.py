@@ -17,6 +17,7 @@ from tortoise.transactions import in_transaction
 
 from zhenxun.models.group_console import GroupConsole
 from zhenxun.models.group_tag import GroupTag, GroupTagLink
+from zhenxun.services import group_bot_selector
 from zhenxun.services.log import logger
 from zhenxun.utils.platform import PlatformUtils
 
@@ -514,14 +515,23 @@ class TagManager:
             标签对应的群组 ID 列表。当标签不存在或无法解析时返回空列表。
         """
         if name == "@all":
+            # 多账号下"所有群"必须是所有在线账号的群并集，否则只有另一个账号在的群
+            # 会被整体漏掉（定时全群推送的典型症状）。单账号/熔断时保持按单个 Bot 解析。
+            union_group_ids = (
+                await group_bot_selector.all_group_ids(only_adapter_of=bot)
+                if group_bot_selector.all_groups_across_accounts()
+                else set()
+            )
+            if union_group_ids:
+                return sorted(union_group_ids)
             if bot:
                 all_groups, _ = await PlatformUtils.get_group_list(bot)
                 return [str(g.group_id) for g in all_groups if g.group_id]
             else:
-                all_group_ids = await GroupConsole.all().values_list(
+                all_group_ids_in_db = await GroupConsole.all().values_list(
                     "group_id", flat=True
                 )
-                return [str(gid) for gid in all_group_ids]
+                return [str(gid) for gid in all_group_ids_in_db]
 
         tag = await GroupTag.get_or_none(name=name).prefetch_related("groups")
         if not tag:

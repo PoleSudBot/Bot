@@ -748,6 +748,18 @@ def load_rollpig_plugin_module(
         set_key_value=lambda *_args, **_kwargs: None
     )
 
+    async def _fake_select_group_bot(_group_id, *, fallback=None):
+        # 老行为：单账号环境直接沿用调用方给的 Bot，选号细节由专属测试覆盖。
+        return fallback
+
+    fake_group_bot_selector_module = types.ModuleType(
+        "zhenxun.services.group_bot_selector"
+    )
+    fake_group_bot_selector_module.select_group_bot = _fake_select_group_bot
+    fake_group_bot_selector_module.group_plugin_blocked = (
+        lambda _group_id, _module: False
+    )
+
     async def _get_group_member_list(_bot, _group_id):
         return list(group_members)
 
@@ -776,6 +788,7 @@ def load_rollpig_plugin_module(
         "zhenxun.services": fake_zhenxun_services,
         "zhenxun.services.avatar_service": fake_avatar_service_module,
         "zhenxun.services.group_settings_service": fake_group_settings_module,
+        "zhenxun.services.group_bot_selector": fake_group_bot_selector_module,
         "zhenxun.utils": fake_zhenxun_utils,
         "zhenxun.utils.platform": fake_platform_module,
     }.items():
@@ -850,6 +863,7 @@ def load_rollpig_plugin_module(
     fake_runtime.rollpig_today = lambda: __import__("datetime").date(2026, 4, 22)
     fake_runtime.resolve_roast_cooldown_seconds = lambda: 8 * 60 * 60
     fake_runtime.resolve_roast_charge_max = lambda: 2
+    fake_runtime.set_group_enable_checker = lambda *_args, **_kwargs: None
 
     fake_store_module = types.ModuleType(f"{package_name}.store")
     fake_store_module.__path__ = []
@@ -953,6 +967,16 @@ def load_rollpig_plugin_module(
         sys.modules,
         f"{package_name}.data_manager",
         fake_data_manager_module,
+    )
+
+    # daily_push 用真实实现（选号模块已在上方被替换为单账号语义），
+    # 这样日报用例依旧覆盖真实的"渲染 → 选号 → 发送"流程。
+    daily_push_module = load_module_from_path(
+        f"{package_name}.daily_push",
+        ROLLPIG_PLUGIN_DIR / "daily_push.py",
+    )
+    monkeypatch.setitem(
+        sys.modules, f"{package_name}.daily_push", daily_push_module
     )
 
     spec = importlib.util.spec_from_file_location(

@@ -2,6 +2,7 @@ from nonebot.adapters.onebot.v11 import Bot
 from pydantic import BaseModel, Field
 
 from zhenxun.services.ai.core.exceptions import LLMException
+from zhenxun.services.group_bot_selector import select_group_bot
 from zhenxun.services.log import logger
 from zhenxun.services.scheduler import ScheduleContext, scheduler_manager
 
@@ -47,6 +48,17 @@ async def scheduled_summary_task(
         return
 
     task_id = f"summary_task_{group_id}"
+
+    # 按群选号：多账号下必须由真正在该群里的账号读取消息并发送，
+    # 否则调度引擎注入的"第一个连上的号"会给不在它名下的群白白发送失败。
+    send_bot = await select_group_bot(group_id, fallback=bot)
+    if send_bot is None:
+        logger.warning(
+            f"[{task_id}] 群内没有可用账号，跳过本次总结。",
+            group_id=group_id,
+        )
+        return
+
     logger.info(f"开始执行定时总结任务 [{task_id}]", group_id=group_id)
 
     try:
@@ -76,7 +88,7 @@ async def scheduled_summary_task(
         )
 
         result = await get_group_messages(
-            bot,
+            send_bot,
             int(group_id),
             scope,
             use_db=base_config.get("USE_DB_HISTORY", False),
@@ -109,7 +121,7 @@ async def scheduled_summary_task(
         if warning_msg:
             from nonebot_plugin_alconna.uniseg import UniMessage
 
-            await UniMessage.text(warning_msg).send(msg_target, bot)
+            await UniMessage.text(warning_msg).send(msg_target, send_bot)
 
         summary_result = await messages_summary(
             target=msg_target,
@@ -119,7 +131,7 @@ async def scheduled_summary_task(
         )
 
         await send_summary(
-            bot,
+            send_bot,
             msg_target,
             summary_result.summary_text,
             user_info_cache,

@@ -17,6 +17,7 @@ from nonebot.permission import SUPERUSER
 from nonebot.plugin import PluginMetadata
 
 from zhenxun.services.avatar_service import avatar_service
+from zhenxun.services.group_bot_selector import group_plugin_blocked
 from zhenxun.services.group_settings_service import group_settings_service
 from zhenxun.utils.platform import PlatformUtils
 
@@ -54,6 +55,7 @@ from .card_renderer import (
     render_pig_card_image,
     shutdown_card_renderer,
 )
+from .daily_push import push_group_summaries
 from .render_budget import html_render_budget
 from .growth import expert_level_from_copies
 from .resource_manager import pig_resource_manager
@@ -65,6 +67,7 @@ from .runtime import (
     rollpig_today,
     resolve_roast_charge_max,
     resolve_roast_cooldown_seconds,
+    set_group_enable_checker,
 )
 from .store import store
 from .store.cloud import CloudStoreError
@@ -1086,9 +1089,17 @@ def format_cooldown_message(remaining_seconds: int) -> str:
 
 
 # ================================ 群开关守卫 ================================ #
-# 这里统一拦截群聊中的 rollpig 指令入口。
-# 一旦宿主项目（如 nekobot_v2）给 runtime 挂上了外部群开关检查器，
-# 未启用的群将直接静默跳过；没有接控制台时则默认放行。
+# 这里统一拦截群聊中的 rollpig 指令入口，并由本插件接线群开关检查器：
+# 群级关闭 rollpig（webui/群内开关）后，群内指令与日报推送都会静默跳过。
+# 检查器只读群内存快照，缓存未就绪时按未禁用放行。
+def _group_plugin_blocked(group_id: str) -> bool:
+    """群级（含超管群级）关闭 rollpig 时返回 True。"""
+    return group_plugin_blocked(group_id, MODULE_NAME)
+
+
+set_group_enable_checker(_group_plugin_blocked)
+
+
 def guard_group_enabled(matcher):
     def decorator(func):
         @wraps(func)
@@ -2894,20 +2905,27 @@ async def daily_summary_job():
             )
             return
 
-        sent_count = 0
-        for group_id in summary_push_groups:
+        async def _render_daily_summary(group_id: str, summary: dict) -> Message:
+            """渲染日报图；图片失败时回退纯文本，保证该群不因渲染问题被丢掉。"""
             try:
-                panel_kwargs = build_daily_summary_panel(group_summaries[group_id])
+                panel_kwargs = build_daily_summary_panel(summary)
                 pic = await build_panel_picture(**panel_kwargs)
-                message = MessageSegment.image(pic)
+                return MessageSegment.image(pic)
             except Exception as render_error:
-                logger.warning(f"[每日总结] 图片渲染失败，回退文本: group={group_id} error={render_error}")
-                message = build_daily_summary_text(group_summaries[group_id])
-            try:
-                await bot.send_group_msg(group_id=int(group_id), message=message)
-                sent_count += 1
-            except Exception as send_error:
-                logger.warning(f"[每日总结] 推送失败: group={group_id} error={send_error}")
+                logger.warning(
+                    "[每日总结] 图片渲染失败，回退文本: "
+                    f"group={group_id} error={render_error}"
+                )
+                return build_daily_summary_text(summary)
+
+        # 每个群单独选号：只有真正在该群里的账号才会被用来发送（详见 group_bot_selector）。
+        sent_count, _ = await push_group_summaries(
+            group_ids=summary_push_groups,
+            summaries=group_summaries,
+            render=_render_daily_summary,
+            summary_date=summary_date,
+            fallback_bot=bot,
+        )
 
         logger.info(
             "[每日总结] 推送完成: "
